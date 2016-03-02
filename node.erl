@@ -1,10 +1,10 @@
 -module(node).
--export([between/3, locate/2, store/2, join/1, join/2, kth_finger/2]).
+-export([between/3, locate/2, store/2, join/1, join/2]).
 
 -define(Stabilize, 100).
 -define(Timeout, 10000).
 -define(Fix_fingers, 300).
--define(Hash_length, 3).
+-define(Hash_length, 160).
 
 %--------------------------------------------------------------------
 % Node Initiation and Connection.
@@ -18,8 +18,7 @@ join(Inc_id, Peer) ->
   spawn(fun() -> init(Inc_id, Peer) end).
 
 init(Inc_id) ->
-  Id = Inc_id,
-  %<<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),   
+  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),   
   Predecessor = nil,
   Successor = {Id, self()},
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
@@ -28,8 +27,7 @@ init(Inc_id) ->
   node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 init(Inc_id, Peer) ->
-  Id = Inc_id,
-  %<<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),   
+  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),   
   Predecessor = nil,
   Peer ! {find_successor, Id, self()},
   receive
@@ -39,7 +37,6 @@ init(Inc_id, Peer) ->
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
   schedule_stabilize(),
   fix_fingers(),
-  io:fwrite("Successor found: ~w~n", [Successor]),
   node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 
@@ -108,12 +105,10 @@ fix_fingers(Id, Successor, {Index, FT}) ->
 fix_finger(Id, Successor, Index, FT) ->
   Node = kth_finger(Id, Index),
   find_successor(Node, self(), Id, Successor, FT),
-  io:fwrite("Id=~w: Requesting to find successor of Node ~w~n",[Id,Node]),
   receive 
     {successor, Node, Succ} ->
       Succ
   end,
-  io:fwrite("Id=~w: Found successor of Node ~w = ~w~n",[Id,Node,Succ]),
   array:set(Index, Succ, FT).
 
 kth_finger(Id, K) -> (Id + (1 bsl (K-1))) rem (1 bsl ?Hash_length).
@@ -143,8 +138,6 @@ closest_preceding_node(Iter, NodeId, Id, FT) ->
     false ->
       closest_preceding_node(Iter-1, NodeId, Id, FT)
   end.  
-
-
 
   
 %--------------------------------------------------------------------
