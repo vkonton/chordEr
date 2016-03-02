@@ -1,11 +1,21 @@
 -module(node).
--export([between/3, locate/2, store/2, start/1, start/2]).
+-export([test/0, between/3, locate/2, store/2, start/1, start/2]).
 
 -define(Stabilize, 1000).
 -define(Timeout, 10000).
+-define(ReplicationFactor, 2).
 
 %--------------------------------------------------------------------
 % Node Initiation and Connection.
+
+test() ->
+  Pid = start("0"),
+  _ = start("1", Pid),
+  _ = start("2", Pid),
+  _ = start("3", Pid),
+  timer:sleep(6000),
+  [store(lists:flatten(io_lib:format("~p", [X])),  Pid) || X <- lists:seq(0,3)].
+
 
 start(Inc_id) ->
   start(Inc_id, nil).
@@ -38,7 +48,7 @@ connect(_, Peer) ->
 store(Value, Peer) ->
   Qref = make_ref(),
   Key = crypto:hash(sha, Value),
-  Peer ! {add, Key, Value, Qref, self()},
+  Peer ! {add_replicate, Key, ?ReplicationFactor, Value, Qref, self()},
   receive
     {Qref, Ans} ->
       Ans
@@ -148,6 +158,30 @@ add(Key, Value, Qref, Client, Id, {Pkey, _}, {_, Spid}, Store) ->
   end.
 
 
+add_replicate(Key, RepFactor, Value, Qref, Client, Id, {Pkey, _}, {_, Spid}, Store) ->
+  case between(Key, Pkey, Id) of
+    true ->
+      Client ! {Qref, self()},
+      Spid ! {replicate, Key, RepFactor-1, Value},
+      storage:add(Key, Value, Store);
+    false ->
+      Spid ! {add_replicate, Key, RepFactor, Value, Qref, Client},
+      Store
+  end.
+
+
+replicate(Key, Value, RepFactor, {_, Spid}, Store) ->
+  if
+    RepFactor > 1 ->
+      Spid ! {replicate, Key, RepFactor-1, Value},
+      storage:add(Key, Value, Store);
+    RepFactor =:= 1 ->
+       storage:add(Key, Value, Store);
+    RepFactor < 1 ->
+       Store
+  end.
+
+
 lookup(Key, Qref, Client, Id, {Pkey, _}, Successor, Store) ->
   case between(Key, Pkey, Id) of
     true ->
@@ -194,6 +228,17 @@ node(Id, Predecessor, Successor, Store) ->
 		  Id, Predecessor, Successor, Store),
       node(Id, Predecessor, Successor, Added);
 
+    % add an element to the dht and inform k-1 successors to
+    % replicate it.
+    {add_replicate, Key, RepFactor, Value, Qref, Client} ->
+      Added = add_replicate(Key, RepFactor, Value, Qref, Client,
+		            Id, Predecessor, Successor, Store),
+      node(Id, Predecessor, Successor, Added);
+
+    {replicate, Key, RepFactor, Value} ->
+      Added = replicate(Key, Value, RepFactor, Successor, Store),
+      node(Id, Predecessor, Successor, Added);
+
     % query for an element in the dht
     {lookup, Key, Qref, Client} ->
       lookup(Key, Qref, Client, Id, Predecessor, Successor, Store),
@@ -208,7 +253,7 @@ node(Id, Predecessor, Successor, Store) ->
       case Skey of
 	Id ->
 	  Client ! {Qref, [{Id, Store}]};
-        Skey ->
+	Skey ->
 	  Spid ! {collect_all, Qref, Client, Id, [{Id, Store}]}
       end,
       node(Id, Predecessor, Successor, Store);
@@ -223,42 +268,42 @@ node(Id, Predecessor, Successor, Store) ->
       end,
       node(Id, Predecessor, Successor, Store);
 
-	% stop node gracefully
-	stop ->
-	  Successor ! {handover, Store},
-	  exit(normal);
+    % stop node gracefully
+    stop ->
+      Successor ! {handover, Store},
+      exit(normal);
 
 
-	%----------------------------------------------------------------
-	% Debug messages
+    %----------------------------------------------------------------
+    % Debug messages
 
-	% probe messages for ring connectivity testing
+    % probe messages for ring connectivity testing
 
-	list_store ->
-	  [io:format("~p ", [Y]) || {_,Y} <- Store],
-	  node(Id, Predecessor, Successor, Store);
+    list_store ->
+      [io:format("~p ", [Y]) || {_,Y} <- Store],
+      node(Id, Predecessor, Successor, Store);
 
-	probe ->
-	  create_probe(Id, Successor),
-	  node(Id, Predecessor, Successor, Store);
+    probe ->
+      create_probe(Id, Successor),
+      node(Id, Predecessor, Successor, Store);
 
-	{probe, Id, Nodes, T} ->
-	  remove_probe(T, Nodes),
-	  node(Id, Predecessor, Successor, Store);
+    {probe, Id, Nodes, T} ->
+      remove_probe(T, Nodes),
+      node(Id, Predecessor, Successor, Store);
 
-	{probe, Ref, Nodes, T} ->
-	  forward_probe(Ref, T, Nodes, Id, Successor),
-	  node(Id, Predecessor, Successor, Store);
+    {probe, Ref, Nodes, T} ->
+      forward_probe(Ref, T, Nodes, Id, Successor),
+      node(Id, Predecessor, Successor, Store);
 
-	% a simple message to print node state
-	state ->
-	  io:format(' Id : ~w~n Predecessor : ~w~n Successor : ~w~n', [Id, Predecessor, Successor]),
-	  node(Id, Predecessor, Successor, Store);
+    % a simple message to print node state
+    state ->
+      io:format(' Id : ~w~n Predecessor : ~w~n Successor : ~w~n', [Id, Predecessor, Successor]),
+      node(Id, Predecessor, Successor, Store);
 
-	_ ->
-	  io:format('Invalid message received.'),
-	  node(Id, Predecessor, Successor, Store)
-      end.
+    _ ->
+      io:format('Invalid message received.'),
+      node(Id, Predecessor, Successor, Store)
+  end.
 
 
 %%-------------------------------------------------------------------
