@@ -1,9 +1,9 @@
 -module(node).
 -export([parse/1, between/3, locate/2, store/3, join/1, join/2]).
 
--define(Stabilize, 10).
+-define(Stabilize, 3).
 -define(Timeout, 10000).
--define(Fix_fingers, 30).
+-define(Fix_fingers, 9).
 -define(Hash_length, 160).
 
 
@@ -58,13 +58,14 @@ init(Inc_id, Peer) ->
 
 store(Key, Value, Peer) ->
   Qref = make_ref(),
-  <<Hkey:?Hash_length/integer>> = crypto:hash(sha, <<Key>>),
-  Peer ! {add, Hkey, Value, Qref, self()},
+  <<Hkey:?Hash_length/integer>> = crypto:hash(sha, Key),
+  Peer ! {add, Hkey, {Key,Value}, Qref, self()},
   receive
     {Qref, Ans} ->
       Ans
-  after ?Timeout ->
-	  io:format("Time out: no response~n", [])
+  after
+    ?Timeout ->
+      io:format("Time out: no response~n", [])
   end.
 
 locate("*", Peer) ->
@@ -74,15 +75,16 @@ locate("*", Peer) ->
     {Qref, All_stores} ->
       All_stores
   end;
-locate(Value, Peer) ->
+locate(Key, Peer) ->
   Qref = make_ref(),
-  <<Key:?Hash_length/integer>> = crypto:hash(sha, Value),
-  Peer ! {lookup, Key, Qref, self()},
+  <<HKey:?Hash_length/integer>> = crypto:hash(sha, Key),
+  Peer ! {lookup, HKey, Qref, self()},
   receive
     {Qref, Node, Item} ->
       {Node, Item}
-  after ?Timeout ->
-	  io:format("Time out: no response~n", [])
+  after
+    ?Timeout ->
+      io:format("Time out: no response~n", [])
   end.
 
 
@@ -109,12 +111,12 @@ fix_fingers() ->
 
 
 fix_fingers(Id, Successor, {Index, FT}) ->
-  NewIndex = case Index+1 > ?Hash_length of
-	       true ->
-		 1;
-	       false ->
-		 Index + 1
-	     end,
+  case Index+1 > ?Hash_length of
+    true ->
+      NewIndex = 1;
+    false ->
+      NewIndex = Index + 1
+  end,
   NewFT = fix_finger(Id, Successor, NewIndex, FT),
   {NewIndex, NewFT}.
 
@@ -128,7 +130,6 @@ fix_finger(Id, Successor, Index, FT) ->
   array:set(Index, Succ, FT).
 
 kth_finger(Id, K) -> (Id + (1 bsl (K-1))) rem (1 bsl ?Hash_length).
-
 
 find_successor(Node, Peer, Id, Successor, FT) ->
   {Skey, _} = Successor,
@@ -211,13 +212,18 @@ handover(Id, Store, Nkey, Npid) ->
   Keep.
 
 
-add(Key, Value, Qref, Client, Id, {Pkey, _}, {_, Spid}, Store) ->
+add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor, FT, Store) ->
   case between(Key, Pkey, Id) of
     true ->
       Client ! {Qref, self()},
       storage:add(Key, Value, Store);
     false ->
-      Spid ! {add, Key, Value, Qref, Client},
+      find_successor(Key, self(), Id, Successor, FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {add, Key, Value, Qref, Client},
       Store
   end.
 
@@ -228,8 +234,12 @@ lookup(Key, Qref, Client, Id, {Pkey, _}, Store, FT) ->
       Result = storage:lookup(Key, Store),
       Client ! {Qref, self(), Result};
     false ->
-      {_, Spid} = closest_preceding_node(Key, Id, FT),
-      Spid ! {lookup, Key, Qref, Client}
+      find_successor(Key, self(), Id, array:get(1, FT), FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {lookup, Key, Qref, Client}
   end.
 
 
@@ -279,12 +289,12 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     % add an element to the dht
     {add, Key, Value, Qref, Client} ->
       Added = add(Key, Value, Qref, Client,
-		  Id, Predecessor, Successor, Store),
+		  Id, Predecessor, Successor, FT, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
 
     % query for an element in the dht
     {lookup, Key, Qref, Client} ->
-      lookup(Key, Qref, Client, Id, Predecessor, Store, FingerTable),
+      lookup(Key, Qref, Client, Id, Predecessor, Store, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     {handover, Elements} ->
@@ -370,5 +380,3 @@ remove_probe(T, Nodes) ->
 
 forward_probe(Ref, T, Nodes, Id, {_,Spid}) ->
   Spid ! {probe,Ref,Nodes ++ [Id],T}.
-
-
