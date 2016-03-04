@@ -1,10 +1,26 @@
 -module(node).
--export([between/3, locate/2, store/2, join/1, join/2]).
+-export([parse/1, between/3, locate/2, store/3, join/1, join/2]).
 
--define(Stabilize, 100).
+-define(Stabilize, 10).
 -define(Timeout, 10000).
--define(Fix_fingers, 300).
+-define(Fix_fingers, 30).
 -define(Hash_length, 160).
+
+
+parse(Filename) ->
+  {ok, Data} = file:read_file(Filename),
+  D = binary_to_list(Data),
+  Xs = string:tokens(D,",\n"),
+  {Keys, Values} = split_it(Xs),
+  lists:zip(Keys, Values).
+
+split_it(L) -> split_it(L, [], []).
+
+split_it([], Keys, Values) ->
+  {Keys, Values};
+split_it([X, Y|Xs], Keys, Values) ->
+  {K, _} = string:to_integer(Y),
+  split_it(Xs, [K|Keys], [X|Values]).
 
 %--------------------------------------------------------------------
 % Node Initiation and Connection.
@@ -18,7 +34,7 @@ join(Inc_id, Peer) ->
   spawn(fun() -> init(Inc_id, Peer) end).
 
 init(Inc_id) ->
-  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),   
+  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
   Predecessor = nil,
   Successor = {Id, self()},
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
@@ -27,7 +43,7 @@ init(Inc_id) ->
   node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 init(Inc_id, Peer) ->
-  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),   
+  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
   Predecessor = nil,
   Peer ! {find_successor, Id, self()},
   receive
@@ -40,10 +56,10 @@ init(Inc_id, Peer) ->
   node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 
-store(Value, Peer) ->
+store(Key, Value, Peer) ->
   Qref = make_ref(),
-  Key = crypto:hash(sha, Value),
-  Peer ! {add, Key, Value, Qref, self()},
+  <<Hkey:?Hash_length/integer>> = crypto:hash(sha, <<Key>>),
+  Peer ! {add, Hkey, Value, Qref, self()},
   receive
     {Qref, Ans} ->
       Ans
@@ -60,7 +76,7 @@ locate("*", Peer) ->
   end;
 locate(Value, Peer) ->
   Qref = make_ref(),
-  Key = crypto:hash(sha, Value),
+  <<Key:?Hash_length/integer>> = crypto:hash(sha, Value),
   Peer ! {lookup, Key, Qref, self()},
   receive
     {Qref, Node, Item} ->
@@ -86,16 +102,16 @@ between2(Key, From, To) when From > To ->
 
 
 %--------------------------------------------------------------------
-% Finger Table Functions 
+% Finger Table Functions
 
 fix_fingers() ->
   timer:send_interval(?Fix_fingers, self(), fix_fingers).
 
 
 fix_fingers(Id, Successor, {Index, FT}) ->
-  NewIndex = case Index+1 > ?Hash_length of 
+  NewIndex = case Index+1 > ?Hash_length of
 	       true ->
-	         1;
+		 1;
 	       false ->
 		 Index + 1
 	     end,
@@ -105,7 +121,7 @@ fix_fingers(Id, Successor, {Index, FT}) ->
 fix_finger(Id, Successor, Index, FT) ->
   Node = kth_finger(Id, Index),
   find_successor(Node, self(), Id, Successor, FT),
-  receive 
+  receive
     {successor, Node, Succ} ->
       Succ
   end,
@@ -115,14 +131,14 @@ kth_finger(Id, K) -> (Id + (1 bsl (K-1))) rem (1 bsl ?Hash_length).
 
 
 find_successor(Node, Peer, Id, Successor, FT) ->
- {Skey, _} = Successor,
- case between(Node, Id, Skey) of
-   true ->
-     Peer ! {successor, Node, Successor};
-   false ->
-     Next = closest_preceding_node(Node, Id, FT),
-     Next ! {find_successor, Node, Peer}
- end.
+  {Skey, _} = Successor,
+  case between(Node, Id, Skey) of
+    true ->
+      Peer ! {successor, Node, Successor};
+    false ->
+      Next = closest_preceding_node(Node, Id, FT),
+      Next ! {find_successor, Node, Peer}
+  end.
 
 
 closest_preceding_node(Node, Id, FT) ->
@@ -137,9 +153,9 @@ closest_preceding_node(Iter, NodeId, Id, FT) ->
       FPid;
     false ->
       closest_preceding_node(Iter-1, NodeId, Id, FT)
-  end.  
+  end.
 
-  
+
 %--------------------------------------------------------------------
 % Node Helper Functions
 
@@ -280,7 +296,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       case Skey of
 	Id ->
 	  Client ! {Qref, [{Id, Store}]};
-        Skey ->
+	Skey ->
 	  Spid ! {collect_all, Qref, Client, Id, [{Id, Store}]}
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
@@ -295,49 +311,49 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-      % stop node gracefully
-      stop ->
-	{_, SPid} = Successor,
-	SPid ! {handover, Store},
-	SPid ! predecessor_failed,
-	SPid ! {notify, Predecessor},
-	exit(normal);
+    % stop node gracefully
+    stop ->
+      {_, SPid} = Successor,
+      SPid ! {handover, Store},
+      SPid ! predecessor_failed,
+      SPid ! {notify, Predecessor},
+      exit(normal);
 
 
-	%----------------------------------------------------------------
-	% Debug messages
+    %----------------------------------------------------------------
+    % Debug messages
 
-	% probe messages for ring connectivity testing
+    % probe messages for ring connectivity testing
 
-	list_store ->
-	  [io:format("~p ", [Y]) || {_,Y} <- Store],
-	  node(Id, Predecessor, Successor, Store, FingerTable);
+    list_store ->
+      [io:format("~p ", [Y]) || {_,Y} <- Store],
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
-	probe ->
-	  create_probe(Id, array:get(1, FingerTable)),
-	  node(Id, Predecessor, Successor, Store, FingerTable);
+    probe ->
+      create_probe(Id, array:get(1, FingerTable)),
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
-	{probe, Id, Nodes, T} ->
-	  remove_probe(T, Nodes),
-	  node(Id, Predecessor, Successor, Store, FingerTable);
+    {probe, Id, Nodes, T} ->
+      remove_probe(T, Nodes),
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
-	{probe, Ref, Nodes, T} ->
-	  forward_probe(Ref, T, Nodes, Id, Successor),
-	  node(Id, Predecessor, Successor, Store, FingerTable);
+    {probe, Ref, Nodes, T} ->
+      forward_probe(Ref, T, Nodes, Id, Successor),
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
-	% a simple message to print node state
-	state ->
-	  io:format(' Id : ~w~n Predecessor : ~w~n Successor : ~w~n', [Id, Predecessor, Successor]),
-	  node(Id, Predecessor, Successor, Store, FingerTable);
+    % a simple message to print node state
+    state ->
+      io:format(' Id : ~w~n Predecessor : ~w~n Successor : ~w~n', [Id, Predecessor, Successor]),
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
-        get_ft ->
-	  io:format('Finger Table: ~w~n', [tl(array:to_list(FT))]),
-	  node(Id, Predecessor, Successor, Store, FingerTable);
+    get_ft ->
+      io:format('Finger Table: ~w~n', [tl(array:to_list(FT))]),
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
-	Msg ->
-	  io:format('Invalid message received (~w)~n',[Msg]),
-	  node(Id, Predecessor, Successor, Store, FingerTable)
-      end.
+    Msg ->
+      io:format('Invalid message received (~w)~n',[Msg]),
+      node(Id, Predecessor, Successor, Store, FingerTable)
+  end.
 
 
 %%-------------------------------------------------------------------
