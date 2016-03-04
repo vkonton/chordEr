@@ -1,9 +1,14 @@
 -module(test).
--export([make_ring/1, parse/1, test_inserts/1, test_inserts/2]).
+-export([make_ring/1,
+	 parse/1,
+	 test_inserts/1,
+	 test_inserts/2,
+	 test_storage_length/1
+	]).
 
 make_ring(N) ->
   P0 = node:join(0),
-  T = lists:foldl(fun (X, Acc) -> timer:sleep(5000), H = node:join(X, P0), [H|Acc] end, [], lists:seq(1, N-1)),
+  T = lists:foldl(fun (X, Acc) -> H = node:join(X, P0), [H|Acc] end, [], lists:seq(1, N-1)),
   T ++ [P0].
 
 test_inserts(N) ->
@@ -11,9 +16,12 @@ test_inserts(N) ->
 
 test_inserts(Filename, N) ->
   [H | _] = make_ring(N),
-  timer:sleep(10000),
+  timer:sleep(20000),
   L = parse(Filename),
   [node:store(Key, Val, H) || {Key, Val} <- L].
+
+test_storage_length(Peer) ->
+ [length(X) || {_, X} <- node:locate("*", Peer)].
 
 
 parse(Filename) ->

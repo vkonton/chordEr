@@ -3,7 +3,7 @@
 
 -define(Stabilize, 3).
 -define(Timeout, 10000).
--define(Fix_fingers, 9).
+-define(Fix_fingers, 3000).
 -define(Hash_length, 160).
 
 
@@ -67,6 +67,7 @@ store(Key, Value, Peer) ->
     ?Timeout ->
       io:format("Time out: no response~n", [])
   end.
+
 
 locate("*", Peer) ->
   Qref = make_ref(),
@@ -282,8 +283,8 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       Updated_FT = fix_fingers(Id, Successor, FingerTable),
       node(Id, Predecessor, Successor, Store, Updated_FT);
 
-    % Predecessor failed
-    predecessor_failed ->
+    % Predecessor stopped
+    predecessor_stopped ->
       node(Id, nil, Successor, Store, FingerTable);
 
     % add an element to the dht
@@ -324,8 +325,10 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     % stop node gracefully
     stop ->
       {_, SPid} = Successor,
+      {Pkey, PPid} = Predecessor,
       SPid ! {handover, Store},
-      SPid ! predecessor_failed,
+      SPid ! predecessor_stopped,
+      PPid ! {successor, Pkey, Successor},
       SPid ! {notify, Predecessor},
       exit(normal);
 
