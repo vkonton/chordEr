@@ -5,6 +5,7 @@
 -define(Timeout, 10000).
 -define(Fix_fingers, 3000).
 -define(Hash_length, 160).
+-define(ReplicationFactor, 5).
 
 
 parse(Filename) ->
@@ -40,7 +41,7 @@ init(Inc_id) ->
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
   schedule_stabilize(),
   fix_fingers(),
-  node(Id, Predecessor, Successor, storage:create(), FingerTable).
+  node(Id, Predecessor, Successor, storage_map:create(), FingerTable).
 
 init(Inc_id, Peer) ->
   <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
@@ -53,7 +54,7 @@ init(Inc_id, Peer) ->
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
   schedule_stabilize(),
   fix_fingers(),
-  node(Id, Predecessor, Successor, storage:create(), FingerTable).
+  node(Id, Predecessor, Successor, storage_map:create(), FingerTable).
 
 
 store(Key, Value, Peer) ->
@@ -194,12 +195,12 @@ stabilize(Pred, Id, Successor) ->
 notify({Nkey, Npid}, Id, Predecessor, Store) ->
   case Predecessor of
     nil ->
-      Keep = handover(Id, Store, Nkey, Npid),
+      Keep = handover(?ReplicationFactor, Id, Store, Nkey, Npid),
       {{Nkey, Npid}, Keep};
     {Pkey, _} ->
       case between(Nkey, Pkey, Id) of
 	true ->
-	  Keep = handover(Pkey, Store, Nkey, Npid),
+	  Keep = handover(?ReplicationFactor, Id, Store, Nkey, Npid),
 	  {{Nkey, Npid}, Keep};
 	false ->
 	  {Predecessor, Store}
@@ -207,17 +208,22 @@ notify({Nkey, Npid}, Id, Predecessor, Store) ->
   end.
 
 
-handover(Id, Store, Nkey, Npid) ->
-  {Keep, Rest} = storage:split(Id, Nkey, Store),
-  Npid ! {handover, Rest},
-  Keep.
+handover(Metadata, Id, Store, Nkey, Npid) ->
+  case storage_map:split(Metadata, Id, Nkey, Store) of
+    {Keep, Rest} ->
+      Npid ! {handover, Rest},
+	  Keep;
+    not_found ->
+      Store
+  end.
 
 
-add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor, FT, Store) ->
+add(Key, RepFactor, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   case between(Key, Pkey, Id) of
     true ->
       Client ! {Qref, self()},
-      storage:add(Key, Value, Store);
+      Spid ! {replicate, Key,  RepFactor-1, Value},
+      storage_map:add(RepFactor, Key, Value, Store);
     false ->
       find_successor(Key, self(), Id, Successor, FT),
       receive
@@ -228,19 +234,29 @@ add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor, FT, Store) ->
       Store
   end.
 
+replicate(Key, RepFactor, Value, {_, Spid}, Store) ->
+  if
+    RepFactor > 1 ->
+      Spid ! {replicate, Key, RepFactor-1, Value},
+      storage_map:add(RepFactor, Key, Value, Store);
+    RepFactor =:= 1 ->
+      storage_map:add(RepFactor, Key, Value, Store);
+    RepFactor < 1 ->
+      Store
+  end.
 
 lookup(Key, Qref, Client, Id, {Pkey, _}, Store, FT) ->
-  case between(Key, Pkey, Id) of
-    true ->
-      Result = storage:lookup(Key, Store),
-      Client ! {Qref, self(), Result};
-    false ->
+  Result = storage_map:full_lookup2(Key, Store),
+  case Result of
+    not_found ->
       find_successor(Key, self(), Id, array:get(1, FT), FT),
       receive
-	{successor, Key, {_, Npid}} ->
-	  Npid
+        {successor, Key, {_, Npid}} ->
+          Npid
       end,
-      Npid ! {lookup, Key, Qref, Client}
+      Npid ! {lookup, Key, Qref, Client};
+    Value ->
+      Client ! {Qref, self(), Value}
   end.
 
 
@@ -289,8 +305,12 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 
     % add an element to the dht
     {add, Key, Value, Qref, Client} ->
-      Added = add(Key, Value, Qref, Client,
+      Added = add(Key, ?ReplicationFactor, Value, Qref, Client,
 		  Id, Predecessor, Successor, FT, Store),
+      node(Id, Predecessor, Successor, Added, FingerTable);
+
+    {replicate, Key, RepFactor, Value} ->
+      Added = replicate(Key, RepFactor, Value, Successor, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
 
     % query for an element in the dht
