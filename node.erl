@@ -1,30 +1,14 @@
 -module(node).
--export([parse/1, between/3, locate/2, store/3, join/1, join/2]).
+-export([join/1, join/2, stop/1, locate/2, store/3, delete/2]).
 
 -define(Stabilize, 3).
 -define(Timeout, 10000).
 -define(Fix_fingers, 3000).
 -define(Hash_length, 160).
--define(ReplicationFactor, 5).
+-define(ReplicationFactor, 3).
 
-
-parse(Filename) ->
-  {ok, Data} = file:read_file(Filename),
-  D = binary_to_list(Data),
-  Xs = string:tokens(D,",\n"),
-  {Keys, Values} = split_it(Xs),
-  lists:zip(Keys, Values).
-
-split_it(L) -> split_it(L, [], []).
-
-split_it([], Keys, Values) ->
-  {Keys, Values};
-split_it([X, Y|Xs], Keys, Values) ->
-  {K, _} = string:to_integer(Y),
-  split_it(Xs, [K|Keys], [X|Values]).
-
-%--------------------------------------------------------------------
-% Node Initiation and Connection.
+%%--------------------------------------------------------------------
+%% Node Initiation and Connection.
 
 join(Inc_id) ->
   timer:start(),
@@ -33,6 +17,9 @@ join(Inc_id) ->
 join(Inc_id, Peer) ->
   timer:start(),
   spawn(fun() -> init(Inc_id, Peer) end).
+
+stop(Peer) ->
+  Peer ! stop.
 
 init(Inc_id) ->
   <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
@@ -90,6 +77,17 @@ locate(Key, Peer) ->
   end.
 
 
+delete(Key, Peer) ->
+  Qref = make_ref(),
+  <<HKey:?Hash_length/integer>> = crypto:hash(sha, Key),
+  Peer ! {primary_lookup, HKey, Qref, self()},
+  receive
+    {Qref, Node} ->
+      Node
+  end,
+  Node ! {delete_key, HKey, ?ReplicationFactor},
+  ok.
+
 between(_, From, From) ->
   true;
 between(Key, From, To) when From < To ->
@@ -105,8 +103,8 @@ between2(Key, From, To) when From > To ->
   (Key > From) or (Key < To).
 
 
-%--------------------------------------------------------------------
-% Finger Table Functions
+%%--------------------------------------------------------------------
+%% Finger Table Functions
 
 fix_fingers() ->
   timer:send_interval(?Fix_fingers, self(), fix_fingers).
@@ -159,8 +157,8 @@ closest_preceding_node(Iter, NodeId, Id, FT) ->
   end.
 
 
-%--------------------------------------------------------------------
-% Node Helper Functions
+%%--------------------------------------------------------------------
+%% Node Helper Functions
 
 schedule_stabilize() ->
   timer:send_interval(?Stabilize, self(), stabilize).
@@ -212,7 +210,7 @@ handover(Metadata, Id, Store, Nkey, Npid) ->
   case storage_map:split(Metadata, Id, Nkey, Store) of
     {Keep, Rest} ->
       Npid ! {handover, Rest},
-	  Keep;
+      Keep;
     not_found ->
       Store
   end.
@@ -245,8 +243,8 @@ replicate(Key, RepFactor, Value, {_, Spid}, Store) ->
       Store
   end.
 
-lookup(Key, Qref, Client, Id, {Pkey, _}, Store, FT) ->
-  Result = storage_map:full_lookup2(Key, Store),
+lookup(Key, Qref, Client, Id, Store, FT) ->
+  Result = storage_map:full_lookup(Key, Store),
   case Result of
     not_found ->
       find_successor(Key, self(), Id, array:get(1, FT), FT),
@@ -259,18 +257,43 @@ lookup(Key, Qref, Client, Id, {Pkey, _}, Store, FT) ->
       Client ! {Qref, self(), Value}
   end.
 
+primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
+  case between(Key, Pkey, Id) of
+    true ->
+      Client ! {Qref, self()};
+    false ->
+      find_successor(Key, self(), Id, array:get(1, FT), FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {primary_lookup, Key, Qref, Client}
+  end.
+      
 
-%--------------------------------------------------------------------
-% The main loop for the node proc.
+delete_key(Key, RepFactor, {_, Spid}, Store) ->
+  if
+    RepFactor > 1 ->
+      Spid ! {delete_key, Key, RepFactor-1},
+      storage_map:delete_key(RepFactor, Key, Store);
+    RepFactor =:= 1 ->
+      storage_map:delete_key(RepFactor, Key, Store);
+    RepFactor < 1 ->
+      Store
+  end.
+
+
+%%--------------------------------------------------------------------
+%% The main loop for the node proc.
 
 node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) ->
   receive
-    % A peer needs to know our key Id
+    %% A peer needs to know our key Id
     {key, Qref, Peer} ->
       Peer ! {Qref, Id},
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-    % A new node entered the ring
+    %% A new node entered the ring
     {notify, New} ->
       {Pred, Keep} = notify(New, Id, Predecessor, Store),
       node(Id, Pred, Successor, Keep, FingerTable);
@@ -286,7 +309,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       Peer ! {successor_status, Predecessor},
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-    % A peer asks us to find the successor of a node
+    %% A peer asks us to find the successor of a node
     {find_successor, Node, Peer} ->
       find_successor(Node, Peer, Id, Successor, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
@@ -299,23 +322,32 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       Updated_FT = fix_fingers(Id, Successor, FingerTable),
       node(Id, Predecessor, Successor, Store, Updated_FT);
 
-    % Predecessor stopped
+    %% Predecessor stopped
     predecessor_stopped ->
       node(Id, nil, Successor, Store, FingerTable);
 
-    % add an element to the dht
+    %% add an element to the dht
     {add, Key, Value, Qref, Client} ->
       Added = add(Key, ?ReplicationFactor, Value, Qref, Client,
 		  Id, Predecessor, Successor, FT, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
 
+    {delete_key, Key, RepFactor} ->
+      Removed = delete_key(Key, RepFactor, Successor, Store),
+      node(Id, Predecessor, Successor, Removed, FingerTable);
+
     {replicate, Key, RepFactor, Value} ->
       Added = replicate(Key, RepFactor, Value, Successor, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
 
-    % query for an element in the dht
+    %% query for an element in the dht
     {lookup, Key, Qref, Client} ->
-      lookup(Key, Qref, Client, Id, Predecessor, Store, FT),
+      lookup(Key, Qref, Client, Id, Store, FT),
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    %% finds the primary storage of a key
+    {primary_lookup, Key, Qref, Client} ->
+      primary_lookup(Key, Qref, Client, Id, Predecessor, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     {handover, Elements} ->
@@ -342,7 +374,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-    % stop node gracefully
+    %% stop node gracefully
     stop ->
       {_, SPid} = Successor,
       {Pkey, PPid} = Predecessor,
@@ -353,13 +385,13 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       exit(normal);
 
 
-    %----------------------------------------------------------------
-    % Debug messages
+    %%----------------------------------------------------------------
+    %% Debug messages
 
-    % probe messages for ring connectivity testing
+    %% probe messages for ring connectivity testing
 
     list_store ->
-      [io:format("~p ", [Y]) || {_,Y} <- Store],
+      [io:format("~p ", [Y]) || {_,Y} <- maps:to_list(Store)],
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     probe ->
@@ -374,7 +406,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       forward_probe(Ref, T, Nodes, Id, Successor),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-    % a simple message to print node state
+    %% a simple message to print node state
     state ->
       io:format(' Id : ~w~n Predecessor : ~w~n Successor : ~w~n', [Id, Predecessor, Successor]),
       node(Id, Predecessor, Successor, Store, FingerTable);

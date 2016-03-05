@@ -3,10 +3,10 @@
 	 add/4,
 	 lookup/3,
 	 full_lookup/2,
-	 full_lookup2/2,
 	 find_value/2,
 	 merge_storage/1,
-	 delete/2,
+	 delete_key/3,
+	 delete_node_storage/2,
 	 change_metadata/3,
 	 split/4,
 	 merge/2]).
@@ -42,20 +42,9 @@ merge_storage(Store) ->
   Ms = [X || {_,X} <- maps:to_list(Store)],
   lists:foldl(fun(X, Y) -> maps:merge(X,Y) end, #{}, Ms).
 
-full_lookup2(Key, Store) ->
+full_lookup(Key, Store) ->
   Merged = merge_storage(Store),
   find_value(Key, Merged).
-
-full_lookup(Key, Store) ->
-  L = maps:to_list(Store),
-  L1 = [find_value(Key, X) || {_, X} <- L],
-  L2 = lists:filter(fun(X) -> X =/= not_found end, L1),
-  case L2 of
-    [] ->
-      not_found;
-    List ->
-      hd(List)
-  end.
 
 find_value(Key, L) ->
   case maps:find(Key, L) of
@@ -82,9 +71,14 @@ lookup(Root, Key, Store) ->
   end.
 
 
-delete(Root, Store) ->
-  maps:remove(Root, Store).
+delete_node_storage(Metadata, Store) ->
+  maps:remove(Metadata, Store).
 
+delete_key(Metadata, Key, Store) ->
+  {ok, Xs} = maps:find(Metadata, Store),
+  NewXs = maps:remove(Key, Xs),
+  maps:update(Metadata, NewXs, Store).
+  
 
 split(Metadata, From, To, Store) ->
   case maps:find(Metadata, Store) of
