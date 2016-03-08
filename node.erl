@@ -1,11 +1,11 @@
 -module(node).
--export([join/1, join/2, stop/1, locate/2, store/3, delete/2]).
+-export([join/1, join/2, stop/1, locate/2, store/3, delete/2, between/3]).
 
 -define(Stabilize, 3).
 -define(Timeout, 10000).
 -define(Fix_fingers, 3000).
 -define(Hash_length, 160).
--define(ReplicationFactor, 3).
+-define(ReplicationFactor, 5).
 
 %%--------------------------------------------------------------------
 %% Node Initiation and Connection.
@@ -28,7 +28,7 @@ init(Inc_id) ->
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
   schedule_stabilize(),
   fix_fingers(),
-  node(Id, Predecessor, Successor, storage_map:create(), FingerTable).
+  node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 init(Inc_id, Peer) ->
   <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
@@ -41,7 +41,7 @@ init(Inc_id, Peer) ->
   FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
   schedule_stabilize(),
   fix_fingers(),
-  node(Id, Predecessor, Successor, storage_map:create(), FingerTable).
+  node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 
 store(Key, Value, Peer) ->
@@ -82,11 +82,12 @@ delete(Key, Peer) ->
   <<HKey:?Hash_length/integer>> = crypto:hash(sha, Key),
   Peer ! {primary_lookup, HKey, Qref, self()},
   receive
-    {Qref, Node} ->
-      Node
+    {Qref, RootId, RootPid} ->
+      {RootId, RootPid}
   end,
-  Node ! {delete_key, HKey, ?ReplicationFactor},
+  RootId ! {delete_key, HKey, RootId, ?ReplicationFactor},
   ok.
+
 
 between(_, From, From) ->
   true;
@@ -94,6 +95,7 @@ between(Key, From, To) when From < To ->
   (Key > From) and (Key =< To);
 between(Key, From, To) when From > To ->
   (Key > From) or (Key =< To).
+
 
 between2(_, From, From) ->
   true;
@@ -120,6 +122,7 @@ fix_fingers(Id, Successor, {Index, FT}) ->
   NewFT = fix_finger(Id, Successor, NewIndex, FT),
   {NewIndex, NewFT}.
 
+
 fix_finger(Id, Successor, Index, FT) ->
   Node = kth_finger(Id, Index),
   find_successor(Node, self(), Id, Successor, FT),
@@ -129,7 +132,9 @@ fix_finger(Id, Successor, Index, FT) ->
   end,
   array:set(Index, Succ, FT).
 
+
 kth_finger(Id, K) -> (Id + (1 bsl (K-1))) rem (1 bsl ?Hash_length).
+
 
 find_successor(Node, Peer, Id, Successor, FT) ->
   {Skey, _} = Successor,
@@ -190,38 +195,51 @@ stabilize(Pred, Id, Successor) ->
   end.
 
 
-notify({Nkey, Npid}, Id, Predecessor, Store) ->
+notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
   case Predecessor of
     nil ->
-      Keep = handover(?ReplicationFactor, Id, Store, Nkey, Npid),
-      {{Nkey, Npid}, Keep};
+      {KeepStore, ToSend} = update_store(Nkey, Id, Store),
+      Npid ! {handover, ToSend},
+      Spid ! {update_store, Nkey, Id, ?ReplicationFactor},
+      Npid ! {delete_extra_replicas, ?ReplicationFactor-1, {Nkey, Npid}},
+      %io:format("o neos: ~w ~n", [Npid]),
+      {{Nkey, Npid}, KeepStore};
     {Pkey, _} ->
       case between(Nkey, Pkey, Id) of
 	true ->
-	  Keep = handover(?ReplicationFactor, Id, Store, Nkey, Npid),
-	  {{Nkey, Npid}, Keep};
+	  {KeepStore, ToSend} = update_store(Nkey, Id, Store),
+	  Npid ! {handover, ToSend},
+	  Spid ! {update_store, Nkey, Id, ?ReplicationFactor-1},
+	  {{Nkey, Npid}, KeepStore};
 	false ->
 	  {Predecessor, Store}
       end
   end.
 
 
-handover(Metadata, Id, Store, Nkey, Npid) ->
-  case storage_map:split(Metadata, Id, Nkey, Store) of
+update_store(Nkey, Id, Store) ->
+  case storage:split(Id, Nkey, Store) of
     {Keep, Rest} ->
-      Npid ! {handover, Rest},
-      Keep;
+      Mine = maps:put(Id, Keep, Store),
+      if
+	Rest =:= #{} ->
+	  NewStore = Mine;
+	true ->
+	  NewStore = maps:put(Nkey, Rest, Mine)
+      end,
+      {NewStore, Rest};
     not_found ->
-      Store
+      {Store, #{}}
   end.
 
 
-add(Key, RepFactor, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
+add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   case between(Key, Pkey, Id) of
+    % my Id is RootId for this Key.
     true ->
       Client ! {Qref, self()},
-      Spid ! {replicate, Key,  RepFactor-1, Value},
-      storage_map:add(RepFactor, Key, Value, Store);
+      Spid ! {replicate, Key, Id, ?ReplicationFactor-1, Value},
+      storage:add(Id, Key, Value, Store);
     false ->
       find_successor(Key, self(), Id, Successor, FT),
       receive
@@ -232,35 +250,38 @@ add(Key, RepFactor, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT,
       Store
   end.
 
-replicate(Key, RepFactor, Value, {_, Spid}, Store) ->
+
+replicate(Key, RootId, RepFactor, Value, {_, Spid}, Store) ->
   if
     RepFactor > 1 ->
-      Spid ! {replicate, Key, RepFactor-1, Value},
-      storage_map:add(RepFactor, Key, Value, Store);
+      Spid ! {replicate, Key, RootId, RepFactor-1, Value},
+      storage:add(RootId, Key, Value, Store);
     RepFactor =:= 1 ->
-      storage_map:add(RepFactor, Key, Value, Store);
+      storage:add(RootId, Key, Value, Store);
     RepFactor < 1 ->
       Store
   end.
 
+
 lookup(Key, Qref, Client, Id, Store, FT) ->
-  Result = storage_map:full_lookup(Key, Store),
+  Result = storage:full_lookup(Key, Store),
   case Result of
     not_found ->
       find_successor(Key, self(), Id, array:get(1, FT), FT),
       receive
-        {successor, Key, {_, Npid}} ->
-          Npid
+	{successor, Key, {_, Npid}} ->
+	  Npid
       end,
       Npid ! {lookup, Key, Qref, Client};
     Value ->
       Client ! {Qref, self(), Value}
   end.
 
+
 primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
   case between(Key, Pkey, Id) of
     true ->
-      Client ! {Qref, self()};
+      Client ! {Qref, Id, self()};
     false ->
       find_successor(Key, self(), Id, array:get(1, FT), FT),
       receive
@@ -269,15 +290,15 @@ primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
       end,
       Npid ! {primary_lookup, Key, Qref, Client}
   end.
-      
 
-delete_key(Key, RepFactor, {_, Spid}, Store) ->
+
+delete_key(Key, RepFactor, RootId, {_, Spid}, Store) ->
   if
     RepFactor > 1 ->
-      Spid ! {delete_key, Key, RepFactor-1},
-      storage_map:delete_key(RepFactor, Key, Store);
+      Spid ! {delete_key, Key, RootId, RepFactor-1},
+      storage:delete_key(RootId, Key, Store);
     RepFactor =:= 1 ->
-      storage_map:delete_key(RepFactor, Key, Store);
+      storage:delete_key(RootId, Key, Store);
     RepFactor < 1 ->
       Store
   end.
@@ -295,7 +316,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 
     %% A new node entered the ring
     {notify, New} ->
-      {Pred, Keep} = notify(New, Id, Predecessor, Store),
+      {Pred, Keep} = notify(New, Id, Predecessor, Successor, Store),
       node(Id, Pred, Successor, Keep, FingerTable);
 
     {successor_status, Pred} ->
@@ -328,17 +349,72 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 
     %% add an element to the dht
     {add, Key, Value, Qref, Client} ->
-      Added = add(Key, ?ReplicationFactor, Value, Qref, Client,
+      Added = add(Key, Value, Qref, Client,
 		  Id, Predecessor, Successor, FT, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
 
-    {delete_key, Key, RepFactor} ->
-      Removed = delete_key(Key, RepFactor, Successor, Store),
+    {delete_key, Key, RootId, RepFactor} ->
+      Removed = delete_key(Key, RepFactor, RootId, Successor, Store),
       node(Id, Predecessor, Successor, Removed, FingerTable);
 
-    {replicate, Key, RepFactor, Value} ->
-      Added = replicate(Key, RepFactor, Value, Successor, Store),
+    {replicate, Key, RootId, RepFactor, Value} ->
+      Added = replicate(Key, RootId, RepFactor, Value, Successor, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
+
+    {delete_extra_replicas, RepFactor, NewNode} ->
+      case Predecessor of
+	nil ->
+	  node(Id, Predecessor, Successor, Store, FingerTable);
+	Predecessor ->
+	  Predecessor
+      end,
+      {_Pkey, Ppid} = Predecessor,
+      {_Skey, Spid} = Successor,
+      case NewNode of
+	nil ->
+	  ok;
+	{_Nkey, Npid} ->
+	  %io:format("o neos apo mesa: ~w ~n", [Npid]),
+	  MyData = storage:get_root_data(Id, Store),
+	  Npid ! {handover, Id, MyData}
+      end,
+      if
+	RepFactor > 1 ->
+	  Ppid ! {delete_extra_replicas, RepFactor-1, NewNode},
+	  Spid ! {delete_my_storage, Id, ?ReplicationFactor};
+	RepFactor =:= 1 ->
+	  Spid ! {delete_my_storage, Id, ?ReplicationFactor};
+	RepFactor < 1 ->
+	  ok
+      end,
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    {delete_my_storage, RootId, RepFactor} ->
+      {_Skey, Spid} = Successor,
+      if
+	RepFactor > 1 ->
+	  Spid ! {delete_my_storage, RootId, RepFactor-1},
+	  NewStore = Store;
+	RepFactor =:= 1 ->
+	  NewStore = storage:delete_node_storage(RootId, Store);
+	RepFactor < 1 ->
+	  NewStore = Store
+      end,
+      node(Id, Predecessor, Successor, NewStore, FingerTable);
+
+    {update_store, Nkey, RootId, RepFactor} ->
+      {_Skey, Spid} = Successor,
+      if
+	RepFactor > 1 ->
+	  {NewStore, _Rest} = update_store(Nkey, RootId, Store),
+	  Spid ! {update_store, Nkey, RootId, RepFactor-1};
+	RepFactor =:= 1 ->
+	  {NStore, _Rest} = update_store(Nkey, RootId, Store),
+	  NewStore = maps:remove(Nkey, NStore);
+	RepFactor < 1 ->
+	  NewStore = Store
+      end,
+      node(Id, Predecessor, Successor, NewStore, FingerTable);
 
     %% query for an element in the dht
     {lookup, Key, Qref, Client} ->
@@ -350,17 +426,21 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       primary_lookup(Key, Qref, Client, Id, Predecessor, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-    {handover, Elements} ->
-      Merged = storage:merge(Store, Elements),
+    {handover, Bucket} ->
+      Merged = storage:add_bucket(Id, Bucket, Store),
+      node(Id, Predecessor, Successor, Merged, FingerTable);
+
+    {handover, RootId, Bucket} ->
+      Merged = maps:put(RootId, Bucket, Store),
       node(Id, Predecessor, Successor, Merged, FingerTable);
 
     {collect_all, Qref, Client} ->
       {Skey, Spid} = Successor,
       case Skey of
 	Id ->
-	  Client ! {Qref, [{Id, Store}]};
+	  Client ! {Qref, [{Id, self(), Store}]};
 	Skey ->
-	  Spid ! {collect_all, Qref, Client, Id, [{Id, Store}]}
+	  Spid ! {collect_all, Qref, Client, Id, [{Id, self(), Store}]}
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
@@ -370,7 +450,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 	  Client ! {Qref, All_stores};
 	Start ->
 	  {_, Spid} = Successor,
-	  Spid ! {collect_all, Qref, Client, Start, [{Id , Store} | All_stores]}
+	  Spid ! {collect_all, Qref, Client, Start, [{Id , self(), Store} | All_stores]}
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
@@ -391,19 +471,20 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     %% probe messages for ring connectivity testing
 
     list_store ->
-      [io:format("~p ", [Y]) || {_,Y} <- maps:to_list(Store)],
+      io:format("~p ", [Store]),%% || Y <- maps:to_list(Store)],
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     probe ->
-      create_probe(Id, array:get(1, FingerTable)),
-      node(Id, Predecessor, Successor, Store, FingerTable);
-
-    {probe, Id, Nodes, T} ->
-      remove_probe(T, Nodes),
+      create_probe(self(), Successor),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     {probe, Ref, Nodes, T} ->
-      forward_probe(Ref, T, Nodes, Id, Successor),
+      case Ref =:= self() of
+	true ->
+	  remove_probe(T, Nodes);
+	false ->
+	  forward_probe(Ref, T, Nodes, Successor)
+      end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     %% a simple message to print node state
@@ -424,14 +505,16 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 %%-------------------------------------------------------------------
 %% Probe functions for ring connectivity testing
 
-create_probe(Id,{_,Spid}) ->
-  Spid ! {probe,Id,[Id],erlang:timestamp()}.
+create_probe(Pid, {_, Spid}) ->
+  Spid ! {probe, Pid, [Pid], erlang:timestamp()}.
+
 
 remove_probe(T, Nodes) ->
   Duration = timer:now_diff(erlang:timestamp(),T),
-  Printer = fun(E) -> io:format("~p ",[E]) end,
+  Printer = fun(E) -> io:format("~w ",[E]) end,
   lists:foreach(Printer,Nodes),
-  io:format("~n Time = ~p",[Duration]).
+  io:format("~n Time = ~p ~n",[Duration]).
 
-forward_probe(Ref, T, Nodes, Id, {_,Spid}) ->
-  Spid ! {probe,Ref,Nodes ++ [Id],T}.
+
+forward_probe(Ref, T, Nodes, {_,Spid}) ->
+  Spid ! {probe,Ref,Nodes ++ [self()],T}.
