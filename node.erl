@@ -1,8 +1,16 @@
 -module(node).
--export([join/1, join/2, stop/1, locate/2, store/3, delete/2, between/3]).
+-export([join/1,
+	 join/2,
+	 stop/1,
+	 locate/2,
+	 store/3,
+	 delete/2,
+	 between/3
+	]).
 
 -define(Stabilize, 1).
 -define(Timeout, 10000).
+-define(FTTimeout, 1000).
 -define(Fix_fingers, 3).
 -define(Hash_length, 160).
 -define(ReplicationFactor, 5).
@@ -129,6 +137,14 @@ fix_finger(Id, Successor, Index, FT) ->
   receive
     {successor, Node, Succ} ->
       Succ
+  after
+    ?FTTimeout ->
+      {_Skey, Spid} = Successor,
+      Spid ! {find_successor, Node, self()},
+      receive
+	{successor, Node, Succ} ->
+	  Succ
+      end
   end,
   array:set(Index, Succ, FT).
 
@@ -160,6 +176,15 @@ closest_preceding_node(Iter, NodeId, Id, FT) ->
     false ->
       closest_preceding_node(Iter-1, NodeId, Id, FT)
   end.
+
+refresh_fingers(Node, NodeSucc, FT) ->
+  lists:foldl(fun(X,Acc) -> case array:get(X,Acc) =:= Node of
+			      true ->
+				array:set(X, NodeSucc, Acc);
+			      false->
+				Acc
+			    end
+	      end, FT, lists:seq(1, ?Hash_length)).
 
 
 %%--------------------------------------------------------------------
@@ -199,16 +224,25 @@ notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
   case Predecessor of
     nil ->
       {KeepStore, ToSend} = update_store(Nkey, Id, Store),
-      Npid ! {handover, ToSend},
+      if
+	ToSend =:= #{} ->
+	  ok;
+	true ->
+	  Npid ! {handover, ToSend}
+      end,
       Spid ! {update_store, Nkey, Id, ?ReplicationFactor},
       Npid ! {delete_extra_replicas, ?ReplicationFactor-1, {Id, self()}},
-      io:format("o neos: ~w ~n", [self()]),
       {{Nkey, Npid}, KeepStore};
     {Pkey, _} ->
       case between(Nkey, Pkey, Id) of
 	true ->
 	  {KeepStore, ToSend} = update_store(Nkey, Id, Store),
-	  Npid ! {handover, ToSend},
+	  if
+	    ToSend =:= #{} ->
+	      ok;
+	    true ->
+	      Npid ! {handover, ToSend}
+	  end,
 	  Spid ! {update_store, Nkey, Id, ?ReplicationFactor-1},
 	  {{Nkey, Npid}, KeepStore};
 	false ->
@@ -379,13 +413,12 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 	nil ->
 	  ok;
 	{_Nkey, Npid} ->
-	  io:format("o neos apo mesa: ~w ~n", [Npid]),
 	  MyData = storage:get_root_data(Id, Store),
 	  if
 	    MyData =:= #{} ->
 	      ok;
 	    true ->
-	     Npid ! {handover, Id, MyData}
+	      Npid ! {handover, Id, MyData}
 	  end
       end,
       if
@@ -464,26 +497,85 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
-    {ptsa, Rref, Succ} ->
-      {_, Yolo} = Successor,
-      Yolo ! {Rref, ok_to_leave},
-      node(Id, Predecessor, Succ, Store, {NextFingerToUpdate, array:set(1, Succ, FT)});
+    {node_exit, Node, NodePredecessor, NodeSuccessor} ->
+      if
+	{Id, self()} =:= NodePredecessor ->
+	  {_, Npid} = Node,
+	  Npid ! exit_ok,
+	  FTnew = FT;
+	true ->
+	  FTnew = refresh_fingers(Node, NodeSuccessor, FT),
+	  {_Pkey, Ppid} = Predecessor,
+	  Ppid ! {node_exit, Node, NodePredecessor, NodeSuccessor}
+      end,
+      node(Id, Predecessor, Successor, Store, {NextFingerToUpdate, FTnew});
 
+    {fix_replicas, OldRootId} ->
+      io:format("Eimai o newRoot, ~p ~n", [self()]),
+      NStore = storage:merge_buckets(OldRootId, Id, Store),
+      {_, Spid} = Successor,
+      Spid ! {merge_replicas, ?ReplicationFactor-1, OldRootId, {Id, self()}},
+      node(Id, Predecessor, Successor, NStore, FingerTable);
+
+    {merge_replicas, RepFactor, OldRootId, NewRoot} ->
+      io:format("Eftasa sto merge manmu, ~p ~n", [self()]),
+      {_, Spid} = Successor,
+      {NewRootId, NewRootPid} = NewRoot,
+      if
+	RepFactor > 1 ->
+	  Spid ! {merge_replicas, RepFactor-1, OldRootId, NewRoot},
+	  NStore = storage:merge_buckets(OldRootId, NewRootId, Store);
+	RepFactor =:= 1 ->
+	  NewRootPid ! {give_me_replicas, self()},
+	  NStore = Store;
+	RepFactor < 1 ->
+	  NStore = Store
+      end,
+      node(Id, Predecessor, Successor, NStore, FingerTable);
+
+    {give_me_replicas, Npid} ->
+      io:format("End to End pro data transfer operation, ~p ~n", [self()]),
+      RootBucket = storage:get_root_data(Id, Store),
+      Npid ! {handover, Id, RootBucket},
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    {last_node, RepFactor, RootPid} ->
+      {_, Spid} = Successor,
+      if
+	RepFactor > 1 ->
+	  Spid ! {last_node, RepFactor-1, RootPid};
+	RepFactor =:= 1 ->
+	  RootPid ! {give_me_replicas, self()};
+	RepFactor < 1 ->
+	  ok
+      end,
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    {replicate_on_last_node, RepFactor} ->
+      {_, Spid} = Successor,
+      {_, Ppid} = Predecessor,
+      if
+	RepFactor >= 1 ->
+	  Ppid ! {replicate_on_last_node, RepFactor-1},
+	  Spid ! {last_node, ?ReplicationFactor-1, self()};
+	RepFactor < 1 ->
+	  ok
+      end,
+      node(Id, Predecessor, Successor, Store, FingerTable);
 
     %% stop node gracefully
     stop ->
-      {_, SPid} = Successor,
-      {Pkey, PPid} = Predecessor,
-      SPid ! {handover, Store},
-      SPid ! {predecessor_stopped, Predecessor},
-      Rref = make_ref(),
-      PPid ! {ptsa, Rref, Successor},
+      {_, Spid} = Successor,
+      {Pkey, Ppid} = Predecessor,
+      Spid ! {predecessor_stopped, Predecessor},
+      Ppid ! {successor, Pkey, Successor},
+      Ppid ! {node_exit, {Id, self()}, Predecessor, Successor},
       receive
-	{Rref, ok_to_leave} ->
-	  ok
-      end,
-      %SPid ! {notify, Predecessor},
-      exit(normal);
+	exit_ok ->
+	  Spid ! {fix_replicas, Id},
+	  Ppid ! {replicate_on_last_node, ?ReplicationFactor-1},
+	  exit(normal)
+      end;
 
 
     %%----------------------------------------------------------------

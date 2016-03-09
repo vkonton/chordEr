@@ -7,6 +7,7 @@
 	 full_lookup/2,
 	 find_value/2,
 	 merge_storage/1,
+	 merge_buckets/3,
 	 delete_key/3,
 	 delete_node_storage/2,
 	 change_metadata/3,
@@ -51,6 +52,17 @@ change_metadata(OldMeta, NewMeta, Store) ->
       maps:put(NewMeta, Xs, Nstore);
     error ->
       Store
+  end.
+
+
+merge_buckets(OldMeta, NewMeta, Store) ->
+  OldBucket = find_value(OldMeta, Store),
+  if
+    OldBucket =:= not_found ->
+      Store;
+    true ->
+      NStore = maps:remove(OldMeta, Store),
+      add_bucket(NewMeta, OldBucket, NStore)
   end.
 
 
