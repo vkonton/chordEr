@@ -1,9 +1,9 @@
 -module(node).
 -export([join/1, join/2, stop/1, locate/2, store/3, delete/2, between/3]).
 
--define(Stabilize, 3).
+-define(Stabilize, 1).
 -define(Timeout, 10000).
--define(Fix_fingers, 3000).
+-define(Fix_fingers, 3).
 -define(Hash_length, 160).
 -define(ReplicationFactor, 5).
 
@@ -201,8 +201,8 @@ notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
       {KeepStore, ToSend} = update_store(Nkey, Id, Store),
       Npid ! {handover, ToSend},
       Spid ! {update_store, Nkey, Id, ?ReplicationFactor},
-      Npid ! {delete_extra_replicas, ?ReplicationFactor-1, {Nkey, Npid}},
-      %io:format("o neos: ~w ~n", [Npid]),
+      Npid ! {delete_extra_replicas, ?ReplicationFactor-1, {Id, self()}},
+      io:format("o neos: ~w ~n", [self()]),
       {{Nkey, Npid}, KeepStore};
     {Pkey, _} ->
       case between(Nkey, Pkey, Id) of
@@ -272,7 +272,12 @@ lookup(Key, Qref, Client, Id, Store, FT) ->
 	{successor, Key, {_, Npid}} ->
 	  Npid
       end,
-      Npid ! {lookup, Key, Qref, Client};
+      if
+	Npid =:= self() ->
+	  Client ! {Qref, self(), not_exists};
+	true ->
+	  Npid ! {lookup, Key, Qref, Client}
+      end;
     Value ->
       Client ! {Qref, self(), Value}
   end.
@@ -344,8 +349,8 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       node(Id, Predecessor, Successor, Store, Updated_FT);
 
     %% Predecessor stopped
-    predecessor_stopped ->
-      node(Id, nil, Successor, Store, FingerTable);
+    {predecessor_stopped, Pred} ->
+      node(Id, Pred, Successor, Store, FingerTable);
 
     %% add an element to the dht
     {add, Key, Value, Qref, Client} ->
@@ -374,9 +379,14 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 	nil ->
 	  ok;
 	{_Nkey, Npid} ->
-	  %io:format("o neos apo mesa: ~w ~n", [Npid]),
+	  io:format("o neos apo mesa: ~w ~n", [Npid]),
 	  MyData = storage:get_root_data(Id, Store),
-	  Npid ! {handover, Id, MyData}
+	  if
+	    MyData =:= #{} ->
+	      ok;
+	    true ->
+	     Npid ! {handover, Id, MyData}
+	  end
       end,
       if
 	RepFactor > 1 ->
@@ -454,14 +464,25 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
+    {ptsa, Rref, Succ} ->
+      {_, Yolo} = Successor,
+      Yolo ! {Rref, ok_to_leave},
+      node(Id, Predecessor, Succ, Store, {NextFingerToUpdate, array:set(1, Succ, FT)});
+
+
     %% stop node gracefully
     stop ->
       {_, SPid} = Successor,
       {Pkey, PPid} = Predecessor,
       SPid ! {handover, Store},
-      SPid ! predecessor_stopped,
-      PPid ! {successor, Pkey, Successor},
-      SPid ! {notify, Predecessor},
+      SPid ! {predecessor_stopped, Predecessor},
+      Rref = make_ref(),
+      PPid ! {ptsa, Rref, Successor},
+      receive
+	{Rref, ok_to_leave} ->
+	  ok
+      end,
+      %SPid ! {notify, Predecessor},
       exit(normal);
 
 
@@ -471,7 +492,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     %% probe messages for ring connectivity testing
 
     list_store ->
-      io:format("~p ", [Store]),%% || Y <- maps:to_list(Store)],
+      io:format("~p ", [Store]),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     probe ->
