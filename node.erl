@@ -5,15 +5,14 @@
 	 locate/2,
 	 store/3,
 	 delete/2,
-	 between/3
-	]).
+	 between/3]).
 
 -define(Stabilize, 1).
 -define(Timeout, 10000).
 -define(FTTimeout, 1000).
 -define(Fix_fingers, 3).
 -define(Hash_length, 160).
--define(ReplicationFactor, 5).
+-define(ReplicationFactor, 1).
 
 %%--------------------------------------------------------------------
 %% Node Initiation and Connection.
@@ -37,6 +36,7 @@ init(Inc_id) ->
   schedule_stabilize(),
   fix_fingers(),
   node(Id, Predecessor, Successor, storage:create(), FingerTable).
+
 
 init(Inc_id, Peer) ->
   <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
