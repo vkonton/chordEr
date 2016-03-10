@@ -7,6 +7,8 @@
 	 test_inserts/2,
 	 test_queries/1,
 	 test_queries/2,
+	 test_removes/1,
+	 test_removes/2,
 	 test_requests/1,
 	 test_requests/2,
 	 test_storage_length/1,
@@ -31,9 +33,9 @@ test_inserts(Peers) ->
   test_inserts("insert.txt", Peers).
 test_inserts(Filename, Peers) ->
   L = parse_inserts(Filename),
-  T0 = erlang:system_time(micro_seconds),
+  T0 = erlang:monotonic_time(micro_seconds),
   Res = [random_store(Key, Val, Peers) || {Key, Val} <- L],
-  T1= erlang:system_time(micro_seconds),
+  T1= erlang:monotonic_time(micro_seconds),
   TimeElapsed = T1-T0,
   io:format("Time elapsed in μSeconds: ~p ~n", [TimeElapsed]),
   io:format("Write Throughtput: ~pμS/Write~n", [TimeElapsed/length(L)]),
@@ -43,9 +45,9 @@ test_queries(Peers) ->
   test_queries("query.txt", Peers).
 test_queries(Filename, Peers) ->
   L = parse_queries(Filename),
-  T0 = erlang:system_time(micro_seconds),
+  T0 = erlang:monotonic_time(micro_seconds),
   Res = [random_query(X, Peers) || X <- L],
-  T1= erlang:system_time(micro_seconds),
+  T1= erlang:monotonic_time(micro_seconds),
   TimeElapsed = T1-T0,
   io:format("Time elapsed in μSeconds: ~p ~n", [TimeElapsed]),
   io:format("Read Throughtput: ~pμS/Read~n", [TimeElapsed/length(L)]),
@@ -56,6 +58,18 @@ test_requests(Peers) ->
 test_requests(Filename, Peers) ->
   L = parse_requests(Filename),
   Res = [exec_request(Req, Peers) || Req <- L],
+  io:format("~p ~n", [Res]).
+
+test_removes(Peers) ->
+  test_removes("remove.txt", Peers).
+test_removes(Filename, Peers) ->
+  L = parse_queries(Filename),
+  T0 = erlang:monotonic_time(micro_seconds),
+  Res = [random_remove(X, Peers) || X <- L],
+  T1= erlang:monotonic_time(micro_seconds),
+  TimeElapsed = T1-T0,
+  io:format("Time elapsed in μSeconds: ~p ~n", [TimeElapsed]),
+  io:format("Read Throughtput: ~pμS/Read~n", [TimeElapsed/length(L)]),
   io:format("~p ~n", [Res]).
 
 
@@ -76,6 +90,12 @@ random_query(Key, Peers) ->
   R = random:uniform(length(Peers)),
   RandomPeer = lists:nth(R, Peers),
   node:locate(Key, RandomPeer).
+
+
+random_remove(Key, Peers) ->
+  R = random:uniform(length(Peers)),
+  RandomPeer = lists:nth(R, Peers),
+  node:remove(Key, RandomPeer).
 
 
 parse_inserts(Filename) ->

@@ -4,7 +4,7 @@
 	 stop/1,
 	 locate/2,
 	 store/3,
-	 delete/2,
+	 remove/2,
 	 between/3]).
 
 -define(Stabilize, 1).
@@ -12,10 +12,17 @@
 -define(FTTimeout, 1000).
 -define(Fix_fingers, 3).
 -define(Hash_length, 160).
--define(ReplicationFactor, 3).
+-define(ReplicationFactor, 5).
+
+%% Default Replication scheme is Eventual.
+-ifndef(EVENTUAL).
+-ifndef(CHAIN).
+-define(EVENTUAL, 1).
+-endif.
+-endif.
 
 %%--------------------------------------------------------------------
-%% Node Initiation and Connection.
+%% Node Initiation and Connection (start/join, stop/exit).
 
 join(Inc_id) ->
   timer:start(),
@@ -52,6 +59,9 @@ init(Inc_id, Peer) ->
   node(Id, Predecessor, Successor, storage:create(), FingerTable).
 
 
+%%-----------------------------------------------------------------------------
+%% Client API (store, locate, remove).
+
 store(Key, Value, Peer) ->
   Qref = make_ref(),
   <<Hkey:?Hash_length/integer>> = crypto:hash(sha, Key),
@@ -85,32 +95,17 @@ locate(Key, Peer) ->
   end.
 
 
-delete(Key, Peer) ->
+remove(Key, Peer) ->
   Qref = make_ref(),
   <<HKey:?Hash_length/integer>> = crypto:hash(sha, Key),
-  Peer ! {primary_lookup, HKey, Qref, self()},
+  Peer ! {delete, HKey, Qref, self()},
   receive
-    {Qref, RootId, RootPid} ->
-      {RootId, RootPid}
-  end,
-  RootId ! {delete_key, HKey, RootId, ?ReplicationFactor},
-  ok.
-
-
-between(_, From, From) ->
-  true;
-between(Key, From, To) when From < To ->
-  (Key > From) and (Key =< To);
-between(Key, From, To) when From > To ->
-  (Key > From) or (Key =< To).
-
-
-between2(_, From, From) ->
-  true;
-between2(Key, From, To) when From < To ->
-  (Key > From) and (Key < To);
-between2(Key, From, To) when From > To ->
-  (Key > From) or (Key < To).
+    {Qref, Ans} ->
+      Ans
+  after
+    ?Timeout ->
+      io:format("Time out: no response~n", [])
+  end.
 
 
 %%--------------------------------------------------------------------
@@ -172,14 +167,19 @@ closest_preceding_node(Iter, NodeId, Id, FT) ->
       closest_preceding_node(Iter-1, NodeId, Id, FT)
   end.
 
+
 refresh_fingers(Node, NodeSucc, FT) ->
-  lists:foldl(fun(X,Acc) -> case array:get(X,Acc) =:= Node of
-			      true ->
-				array:set(X, NodeSucc, Acc);
-			      false->
-				Acc
-			    end
-	      end, FT, lists:seq(1, ?Hash_length)).
+  lists:foldl(
+    fun(X,Acc) ->
+	case array:get(X,Acc) =:= Node of
+	  true ->
+	    array:set(X, NodeSucc, Acc);
+	  false->
+	    Acc
+	end
+    end,
+    FT,
+    lists:seq(1, ?Hash_length)).
 
 
 %%--------------------------------------------------------------------
@@ -246,6 +246,7 @@ notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
   end.
 
 
+%% split my store and return two buckets upon node insert.
 update_store(Nkey, Id, Store) ->
   case storage:split(Id, Nkey, Store) of
     {Keep, Rest} ->
@@ -262,13 +263,84 @@ update_store(Nkey, Id, Store) ->
   end.
 
 
+replicate_chain(Key, RootId, RepFactor, Value, {_, Spid}, Qref, Client, Store) ->
+  if
+    RepFactor > 1 ->
+      Nstore = storage:add(RootId, Key, Value, Store),
+      Spid ! {replicate_chain, Key, RootId, RepFactor-1, Value, Qref, Client};
+    RepFactor =:= 1 ->
+      Nstore = storage:add(RootId, Key, Value, Store),
+      %% The write is complete on all k nodes, inform client.
+      Client ! {Qref, self()};
+    RepFactor < 1 ->
+      Nstore = Store
+  end,
+  Nstore.
+
+
+replicate_eventual(Key, RootId, RepFactor, Value, {_, Spid}, Store) ->
+  if
+    RepFactor > 1 ->
+      Spid ! {replicate_eventual, Key, RootId, RepFactor-1, Value},
+      storage:add(RootId, Key, Value, Store);
+    RepFactor =:= 1 ->
+      storage:add(RootId, Key, Value, Store);
+    RepFactor < 1 ->
+      Store
+  end.
+
+
+delete_replica_chain(Key, RootId, RepFactor, {_, Spid}, Qref, Client, Store) ->
+  if
+    RepFactor > 1 ->
+      Nstore = storage:delete(RootId, Key, Store),
+      Spid ! {delete_replica_chain, Key, RootId, RepFactor-1, Qref, Client};
+    RepFactor =:= 1 ->
+      Nstore = storage:delete(RootId, Key, Store),
+      %% The write is complete on all k nodes, inform client.
+      Client ! {Qref, self()};
+    RepFactor < 1 ->
+      Nstore = Store
+  end,
+  Nstore.
+
+
+delete_replica_eventual(Key, RootId, RepFactor, {_, Spid}, Store) ->
+  if
+    RepFactor > 1 ->
+      Nstore = storage:delete(RootId, Key, Store),
+      Spid ! {delete_replica_eventual, Key, RootId, RepFactor-1};
+    RepFactor =:= 1 ->
+      Nstore = storage:delete(RootId, Key, Store);
+    RepFactor < 1 ->
+      Nstore = Store
+  end,
+  Nstore.
+
+
+primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
+  case between(Key, Pkey, Id) of
+    true ->
+      Client ! {Qref, Id, self()};
+    false ->
+      find_successor(Key, self(), Id, array:get(1, FT), FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {primary_lookup, Key, Qref, Client}
+  end.
+
+%%----------------------------------------------------------------------------
+%% Core functions Implementing Chain Replication.
+-ifdef(CHAIN).
+
 add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   case between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
-      Client ! {Qref, self()},
-      Spid ! {replicate, Key, Id, ?ReplicationFactor-1, Value},
-      storage:add(Id, Key, Value, Store);
+      Spid ! {replicate_chain, Key, Id, ?ReplicationFactor-1, Value, Qref, Client},
+      Nstore = storage:add(Id, Key, Value, Store);
     false ->
       find_successor(Key, self(), Id, Successor, FT),
       receive
@@ -276,20 +348,94 @@ add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
 	  Npid
       end,
       Npid ! {add, Key, Value, Qref, Client},
-      Store
-  end.
+      Nstore = Store
+  end,
+  Nstore.
 
 
-replicate(Key, RootId, RepFactor, Value, {_, Spid}, Store) ->
-  if
-    RepFactor > 1 ->
-      Spid ! {replicate, Key, RootId, RepFactor-1, Value},
-      storage:add(RootId, Key, Value, Store);
-    RepFactor =:= 1 ->
-      storage:add(RootId, Key, Value, Store);
-    RepFactor < 1 ->
-      Store
+delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
+  case between(Key, Pkey, Id) of
+    % my Id is RootId for this Key.
+    true ->
+      Nstore = storage:delete(Id, Key, Store),
+      Client ! {Qref, self()},
+      Spid ! {delete_replica_chain, Key, Id, ?ReplicationFactor-1, Qref, Client};
+    false ->
+      find_successor(Key, self(), Id, Successor, FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {delete, Key, Qref, Client},
+      Nstore = Store
+  end,
+  Nstore.
+
+
+lookup(Key, Qref, Client, Id, Store, FT) ->
+  Result = storage:full_lookup(Key, Store),
+  case Result of
+    not_found ->
+      find_successor(Key, self(), Id, array:get(1, FT), FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      if
+	Npid =:= self() ->
+	  Client ! {Qref, self(), not_exists};
+	true ->
+	  Npid ! {lookup, Key, Qref, Client}
+      end;
+    Value ->
+      Client ! {Qref, self(), Value}
   end.
+
+-endif.
+
+
+%%----------------------------------------------------------------------------
+%% Core functions Implementing Eventual Replication.
+-ifdef(EVENTUAL).
+
+%% The message to client that the write is complete is sent by the
+%% root(master) node.
+add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
+  case between(Key, Pkey, Id) of
+    % my Id is RootId for this Key.
+    true ->
+      Client ! {Qref, self()},
+      Spid ! {replicate_eventual, Key, Id, ?ReplicationFactor-1, Value},
+      Nstore = storage:add(Id, Key, Value, Store);
+    false ->
+      find_successor(Key, self(), Id, Successor, FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {add, Key, Value, Qref, Client},
+      Nstore = Store
+  end,
+  Nstore.
+
+
+delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
+  case between(Key, Pkey, Id) of
+    % my Id is RootId for this Key.
+    true ->
+      Nstore = storage:delete(Id, Key, Store),
+      Client ! {Qref, self()},
+      Spid ! {delete_replica_eventual, Key, Id, ?ReplicationFactor-1};
+    false ->
+      find_successor(Key, self(), Id, Successor, FT),
+      receive
+	{successor, Key, {_, Npid}} ->
+	  Npid
+      end,
+      Npid ! {delete, Key, Qref, Client},
+      Nstore = Store
+  end,
+  Nstore.
 
 
 lookup(Key, Qref, Client, Id, Store, FT) ->
@@ -312,30 +458,8 @@ lookup(Key, Qref, Client, Id, Store, FT) ->
   end.
 
 
-primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
-  case between(Key, Pkey, Id) of
-    true ->
-      Client ! {Qref, Id, self()};
-    false ->
-      find_successor(Key, self(), Id, array:get(1, FT), FT),
-      receive
-	{successor, Key, {_, Npid}} ->
-	  Npid
-      end,
-      Npid ! {primary_lookup, Key, Qref, Client}
-  end.
 
-
-delete_key(Key, RepFactor, RootId, {_, Spid}, Store) ->
-  if
-    RepFactor > 1 ->
-      Spid ! {delete_key, Key, RootId, RepFactor-1},
-      storage:delete(RootId, Key, Store);
-    RepFactor =:= 1 ->
-      storage:delete(RootId, Key, Store);
-    RepFactor < 1 ->
-      Store
-  end.
+-endif.
 
 
 %%--------------------------------------------------------------------
@@ -368,6 +492,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       stabilize(Successor),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
+
     %%--------------------------------------------------------------------
     %% Finger Table Messages.
     %% A peer asks us to find the successor of a node
@@ -388,8 +513,9 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 		  Id, Predecessor, Successor, FT, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
 
-    {delete_key, Key, RootId, RepFactor} ->
-      Removed = delete_key(Key, RepFactor, RootId, Successor, Store),
+    {delete, Key, Qref, Client} ->
+      Removed = delete(Key, Qref, Client,
+		       Id, Predecessor, Successor, FT, Store),
       node(Id, Predecessor, Successor, Removed, FingerTable);
 
     %% query for an element in the dht
@@ -402,10 +528,32 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       primary_lookup(Key, Qref, Client, Id, Predecessor, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
+    %%-------------------------------------------------------------------------
+    %% Welcome to Replication Hell.
 
-    {replicate, Key, RootId, RepFactor, Value} ->
-      Added = replicate(Key, RootId, RepFactor, Value, Successor, Store),
+    %% replicate an element when its added to the node's k-1 successors.
+
+    %% The message to client that the write is complete is sent by the
+    %% last node i.e the k-1 successor of the root(master) node.
+    {replicate_chain, Key, RootId, RepFactor, Value, Qref, Client} ->
+      Added = replicate_chain(Key, RootId, RepFactor, Value, Successor, Qref, Client, Store),
       node(Id, Predecessor, Successor, Added, FingerTable);
+
+    {replicate_eventual, Key, RootId, RepFactor, Value} ->
+      Added = replicate_eventual(Key, RootId, RepFactor, Value, Successor, Store),
+      node(Id, Predecessor, Successor, Added, FingerTable);
+
+    %% delete an element's replica from the k-1 successors.
+    {delete_replica_chain, Key, RootId, RepFactor, Qref, Client} ->
+      Deleted = delete_replica_chain(Key, RootId, RepFactor, Successor, Qref, Client, Store),
+      node(Id, Predecessor, Successor, Deleted, FingerTable);
+
+    {delete_replica_eventual, Key, RootId, RepFactor} ->
+      Deleted = delete_replica_eventual(Key, RootId, RepFactor, Successor, Store),
+      node(Id, Predecessor, Successor, Deleted, FingerTable);
+
+    %%-------------------------------------------------------------------------
+    %% Node Join Replication.
 
     {delete_extra_replicas, RepFactor, NewNode} ->
       case Predecessor of
@@ -475,12 +623,12 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       Merged = storage:put_bucket(RootId, Bucket, Store),
       node(Id, Predecessor, Successor, Merged, FingerTable);
 
-
-
+    %%-------------------------------------------------------------------------
+    %% Node Depart Replication.
     {fix_replicas, OldRootId, Bucket} ->
-      io:format("Eimai o newRoot, ~p ~n", [self()]),
-      io:format("Exw ID, ~p ~n", [Id]),
-      test:write("pairnw_apo_ton_12", Bucket),
+      %%io:format("Eimai o newRoot, ~p ~n", [self()]),
+      %%io:format("Exw ID, ~p ~n", [Id]),
+      %%test:write("pairnw_apo_ton_12", Bucket),
       DelStore = storage:delete_bucket(OldRootId, Store),
       NStore = storage:add_bucket(Id, Bucket, DelStore),
 
@@ -491,7 +639,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       node(Id, Predecessor, Successor, NStore, FingerTable);
 
     {merge_replicas, RepFactor, OldRootId, NewRoot} ->
-      io:format("Eftasa sto merge manmu, ~p ~n", [self()]),
+      %% io:format("Eftasa sto merge manmu, ~p ~n", [self()]),
       {_, Spid} = Successor,
       {NewRootId, NewRootPid} = NewRoot,
       if
@@ -537,7 +685,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       node(Id, Predecessor, Successor, Store, FingerTable);
 
 
-
+    %%-------------------------------------------------------------------------
     %% Node Departure.
     {predecessor_stopped, Pred} ->
       node(Id, Pred, Successor, Store, FingerTable);
@@ -658,3 +806,21 @@ remove_probe(T, Nodes) ->
 
 forward_probe(Ref, T, Nodes, {_,Spid}) ->
   Spid ! {probe,Ref,Nodes ++ [self()],T}.
+
+
+%%-----------------------------------------------------------------------------
+%% Help Functions to ensure node and key sorting.
+between(_, From, From) ->
+  true;
+between(Key, From, To) when From < To ->
+  (Key > From) and (Key =< To);
+between(Key, From, To) when From > To ->
+  (Key > From) or (Key =< To).
+
+
+between2(_, From, From) ->
+  true;
+between2(Key, From, To) when From < To ->
+  (Key > From) and (Key < To);
+between2(Key, From, To) when From > To ->
+  (Key > From) or (Key < To).
