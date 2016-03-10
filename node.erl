@@ -12,7 +12,7 @@
 -define(FTTimeout, 1000).
 -define(Fix_fingers, 3).
 -define(Hash_length, 160).
--define(ReplicationFactor, 1).
+-define(ReplicationFactor, 3).
 
 %%--------------------------------------------------------------------
 %% Node Initiation and Connection.
@@ -139,12 +139,7 @@ fix_finger(Id, Successor, Index, FT) ->
       Succ
   after
     ?FTTimeout ->
-      {_Skey, Spid} = Successor,
-      Spid ! {find_successor, Node, self()},
-      receive
-	{successor, Node, Succ} ->
-	  Succ
-      end
+      Succ = array:get(1, FT)
   end,
   array:set(Index, Succ, FT).
 
@@ -254,12 +249,12 @@ notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
 update_store(Nkey, Id, Store) ->
   case storage:split(Id, Nkey, Store) of
     {Keep, Rest} ->
-      Mine = maps:put(Id, Keep, Store),
+      Mine = storage:put_bucket(Id, Keep, Store),
       if
 	Rest =:= #{} ->
 	  NewStore = Mine;
 	true ->
-	  NewStore = maps:put(Nkey, Rest, Mine)
+	  NewStore = storage:put_bucket(Nkey, Rest, Mine)
       end,
       {NewStore, Rest};
     not_found ->
@@ -335,9 +330,9 @@ delete_key(Key, RepFactor, RootId, {_, Spid}, Store) ->
   if
     RepFactor > 1 ->
       Spid ! {delete_key, Key, RootId, RepFactor-1},
-      storage:delete_key(RootId, Key, Store);
+      storage:delete(RootId, Key, Store);
     RepFactor =:= 1 ->
-      storage:delete_key(RootId, Key, Store);
+      storage:delete(RootId, Key, Store);
     RepFactor < 1 ->
       Store
   end.
@@ -348,6 +343,9 @@ delete_key(Key, RepFactor, RootId, {_, Spid}, Store) ->
 
 node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) ->
   receive
+
+    %%--------------------------------------------------------------------
+    %% Basic Ring Stabilization
     %% A peer needs to know our key Id
     {key, Qref, Peer} ->
       Peer ! {Qref, Id},
@@ -362,30 +360,28 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       Succ = stabilize(Pred, Id, Successor),
       node(Id, Predecessor, Succ, Store, {NextFingerToUpdate, array:set(1, Succ, FT)});
 
-    {successor, Id, Succ} ->
-      node(Id, Predecessor, Succ, Store, {NextFingerToUpdate, array:set(1, Succ, FT)});
-
     {request_predecessor, Peer} ->
       Peer ! {successor_status, Predecessor},
-      node(Id, Predecessor, Successor, Store, FingerTable);
-
-    %% A peer asks us to find the successor of a node
-    {find_successor, Node, Peer} ->
-      find_successor(Node, Peer, Id, Successor, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     stabilize ->
       stabilize(Successor),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
+    %%--------------------------------------------------------------------
+    %% Finger Table Messages.
+    %% A peer asks us to find the successor of a node
+    {find_successor, Node, Peer} ->
+      find_successor(Node, Peer, Id, Successor, FT),
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
     fix_fingers ->
       Updated_FT = fix_fingers(Id, Successor, FingerTable),
       node(Id, Predecessor, Successor, Store, Updated_FT);
 
-    %% Predecessor stopped
-    {predecessor_stopped, Pred} ->
-      node(Id, Pred, Successor, Store, FingerTable);
 
+    %%--------------------------------------------------------------------
+    %% Basic Ring Queries
     %% add an element to the dht
     {add, Key, Value, Qref, Client} ->
       Added = add(Key, Value, Qref, Client,
@@ -395,6 +391,17 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     {delete_key, Key, RootId, RepFactor} ->
       Removed = delete_key(Key, RepFactor, RootId, Successor, Store),
       node(Id, Predecessor, Successor, Removed, FingerTable);
+
+    %% query for an element in the dht
+    {lookup, Key, Qref, Client} ->
+      lookup(Key, Qref, Client, Id, Store, FT),
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    %% finds the primary storage of a key
+    {primary_lookup, Key, Qref, Client} ->
+      primary_lookup(Key, Qref, Client, Id, Predecessor, FT),
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
 
     {replicate, Key, RootId, RepFactor, Value} ->
       Added = replicate(Key, RootId, RepFactor, Value, Successor, Store),
@@ -413,7 +420,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 	nil ->
 	  ok;
 	{_Nkey, Npid} ->
-	  MyData = storage:get_root_data(Id, Store),
+	  MyData = storage:get_bucket(Id, Store),
 	  if
 	    MyData =:= #{} ->
 	      ok;
@@ -439,7 +446,7 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 	  Spid ! {delete_my_storage, RootId, RepFactor-1},
 	  NewStore = Store;
 	RepFactor =:= 1 ->
-	  NewStore = storage:delete_node_storage(RootId, Store);
+	  NewStore = storage:delete_bucket(RootId, Store);
 	RepFactor < 1 ->
 	  NewStore = Store
       end,
@@ -453,66 +460,32 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 	  Spid ! {update_store, Nkey, RootId, RepFactor-1};
 	RepFactor =:= 1 ->
 	  {NStore, _Rest} = update_store(Nkey, RootId, Store),
-	  NewStore = maps:remove(Nkey, NStore);
+	  NewStore = storage:delete_bucket(Nkey, NStore);
 	RepFactor < 1 ->
 	  NewStore = Store
       end,
       node(Id, Predecessor, Successor, NewStore, FingerTable);
 
-    %% query for an element in the dht
-    {lookup, Key, Qref, Client} ->
-      lookup(Key, Qref, Client, Id, Store, FT),
-      node(Id, Predecessor, Successor, Store, FingerTable);
-
-    %% finds the primary storage of a key
-    {primary_lookup, Key, Qref, Client} ->
-      primary_lookup(Key, Qref, Client, Id, Predecessor, FT),
-      node(Id, Predecessor, Successor, Store, FingerTable);
 
     {handover, Bucket} ->
       Merged = storage:add_bucket(Id, Bucket, Store),
       node(Id, Predecessor, Successor, Merged, FingerTable);
 
     {handover, RootId, Bucket} ->
-      Merged = maps:put(RootId, Bucket, Store),
+      Merged = storage:put_bucket(RootId, Bucket, Store),
       node(Id, Predecessor, Successor, Merged, FingerTable);
 
-    {collect_all, Qref, Client} ->
-      {Skey, Spid} = Successor,
-      case Skey of
-	Id ->
-	  Client ! {Qref, [{Id, self(), Store}]};
-	Skey ->
-	  Spid ! {collect_all, Qref, Client, Id, [{Id, self(), Store}]}
-      end,
-      node(Id, Predecessor, Successor, Store, FingerTable);
 
-    {collect_all, Qref, Client, Start, All_stores} ->
-      case Start of
-	Id ->
-	  Client ! {Qref, All_stores};
-	Start ->
-	  {_, Spid} = Successor,
-	  Spid ! {collect_all, Qref, Client, Start, [{Id , self(), Store} | All_stores]}
-      end,
-      node(Id, Predecessor, Successor, Store, FingerTable);
 
-    {node_exit, Node, NodePredecessor, NodeSuccessor} ->
-      if
-	{Id, self()} =:= NodePredecessor ->
-	  {_, Npid} = Node,
-	  Npid ! exit_ok,
-	  FTnew = FT;
-	true ->
-	  FTnew = refresh_fingers(Node, NodeSuccessor, FT),
-	  {_Pkey, Ppid} = Predecessor,
-	  Ppid ! {node_exit, Node, NodePredecessor, NodeSuccessor}
-      end,
-      node(Id, Predecessor, Successor, Store, {NextFingerToUpdate, FTnew});
-
-    {fix_replicas, OldRootId} ->
+    {fix_replicas, OldRootId, Bucket} ->
       io:format("Eimai o newRoot, ~p ~n", [self()]),
-      NStore = storage:merge_buckets(OldRootId, Id, Store),
+      io:format("Exw ID, ~p ~n", [Id]),
+      test:write("pairnw_apo_ton_12", Bucket),
+      DelStore = storage:delete_bucket(OldRootId, Store),
+      NStore = storage:add_bucket(Id, Bucket, DelStore),
+
+      test:write("TOYOLO2", NStore),
+
       {_, Spid} = Successor,
       Spid ! {merge_replicas, ?ReplicationFactor-1, OldRootId, {Id, self()}},
       node(Id, Predecessor, Successor, NStore, FingerTable);
@@ -523,8 +496,8 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       {NewRootId, NewRootPid} = NewRoot,
       if
 	RepFactor > 1 ->
-	  Spid ! {merge_replicas, RepFactor-1, OldRootId, NewRoot},
-	  NStore = storage:merge_buckets(OldRootId, NewRootId, Store);
+	  NStore = storage:merge_buckets(OldRootId, NewRootId, Store),
+	  Spid ! {merge_replicas, RepFactor-1, OldRootId, NewRoot};
 	RepFactor =:= 1 ->
 	  NewRootPid ! {give_me_replicas, self()},
 	  NStore = Store;
@@ -534,8 +507,8 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       node(Id, Predecessor, Successor, NStore, FingerTable);
 
     {give_me_replicas, Npid} ->
-      io:format("End to End pro data transfer operation, ~p ~n", [self()]),
-      RootBucket = storage:get_root_data(Id, Store),
+      io:format("End to End pro data transfer operation, from ~p to ~p ~n", [self(), Npid]),
+      RootBucket = storage:get_bucket(Id, Store),
       Npid ! {handover, Id, RootBucket},
       node(Id, Predecessor, Successor, Store, FingerTable);
 
@@ -563,6 +536,38 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       end,
       node(Id, Predecessor, Successor, Store, FingerTable);
 
+
+
+    %% Node Departure.
+    {predecessor_stopped, Pred} ->
+      node(Id, Pred, Successor, Store, FingerTable);
+
+    {successor, Id, Succ} ->
+      node(Id, Predecessor, Succ, Store, {NextFingerToUpdate, array:set(1, Succ, FT)});
+
+    {node_exit, Node, NodePredecessor, NodeSuccessor} ->
+      {_, Spid} = Successor,
+      if
+	{Id, self()} =:= NodeSuccessor ->
+	  Spid ! exit_ok,
+	  FTnew = FT;
+	true ->
+	  FTnew = refresh_fingers(Node, NodeSuccessor, FT),
+	  {_Pkey, Ppid} = Predecessor,
+	  Ppid ! {node_exit, Node, NodePredecessor, NodeSuccessor},
+	  receive
+	    exit_ok ->
+	      if
+		{Id, self()} =:= NodePredecessor ->
+		  {_Nkey, Npid} = Node,
+		  Npid ! exit_ok;
+		true ->
+		  Spid ! exit_ok
+	      end
+	  end
+      end,
+      node(Id, Predecessor, Successor, Store, {NextFingerToUpdate, FTnew});
+
     %% stop node gracefully
     stop ->
       {_, Spid} = Successor,
@@ -572,7 +577,9 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       Ppid ! {node_exit, {Id, self()}, Predecessor, Successor},
       receive
 	exit_ok ->
-	  Spid ! {fix_replicas, Id},
+	  ToSend = storage:get_bucket(Id,Store),
+	  test:write("dinei_o_12", ToSend),
+	  Spid ! {fix_replicas, Id, ToSend},
 	  Ppid ! {replicate_on_last_node, ?ReplicationFactor-1},
 	  exit(normal)
       end;
@@ -581,6 +588,26 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     %%----------------------------------------------------------------
     %% Debug messages
 
+    %% Collect all Data from the DHT.
+    {collect_all, Qref, Client} ->
+      {Skey, Spid} = Successor,
+      case Skey of
+	Id ->
+	  Client ! {Qref, [{Id, self(), Store}]};
+	Skey ->
+	  Spid ! {collect_all, Qref, Client, Id, [{Id, self(), Store}]}
+      end,
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    {collect_all, Qref, Client, Start, All_stores} ->
+      case Start of
+	Id ->
+	  Client ! {Qref, All_stores};
+	Start ->
+	  {_, Spid} = Successor,
+	  Spid ! {collect_all, Qref, Client, Start, [{Id , self(), Store} | All_stores]}
+      end,
+      node(Id, Predecessor, Successor, Store, FingerTable);
     %% probe messages for ring connectivity testing
 
     list_store ->

@@ -10,8 +10,10 @@
 	 test_requests/1,
 	 test_requests/2,
 	 test_storage_length/1,
-	 pretty_print/1,
+	 pretty_print/2,
 	 write/2,
+	 output_stores/2,
+	 take/2,
 	 clr/0]).
 
 
@@ -113,21 +115,36 @@ split_it([X, Y|Xs], Keys, Values) ->
   split_it(Xs, [K|Keys], [X|Values]).
 
 
-pretty_print(AllStores) ->
-  [{Pid, Id, bucket_pretty_print(maps:to_list(HshTbl))} || {Id, Pid, HshTbl} <- AllStores].
+pretty_print(Peer, N) ->
+  AllStores = node:locate("*", Peer),
+  L = [{Pid, Id, bucket_pretty_print(maps:to_list(HshTbl), N)} || {Id, Pid, HshTbl} <- AllStores],
+  io:format("~p ~n", [L]).
+
+output_stores(Filename, Peer) ->
+  AllStores = node:locate("*", Peer),
+  L = [{Pid, Id, bucket_pretty_print(maps:to_list(HshTbl), all)} || {Id, Pid, HshTbl} <- AllStores],
+  write(Filename, L).
+
+bucket_pretty_print(Bucket, N) ->
+  [{Id, del_keys_from_hash(MiniHshTbl, N)} || {Id, MiniHshTbl} <- Bucket].
 
 
-bucket_pretty_print(Bucket) ->
-  [{Id, del_keys_from_hash(MiniHshTbl)} || {Id, MiniHshTbl} <- Bucket].
-
-
-del_keys_from_hash(Hash) ->
+del_keys_from_hash(Hash, N) ->
   case [Y || {_X, Y} <- maps:to_list(Hash)] of
     [] ->
       no_data;
     X ->
-      hd(X)
+      case N of
+	all ->
+	  X;
+	N ->
+	  take(N,X)
+      end
   end.
 
+take(_, []) -> [];
+take(0, _) -> [];
+take(N, [H|T]) when N > 0 ->
+  [H|take(N-1, T)].
 
 clr() -> io:format("\033[2J").

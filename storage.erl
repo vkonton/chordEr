@@ -1,33 +1,25 @@
 -module(storage).
 -export([create/0,
-	 get_root_data/2,
 	 add/4,
-	 add_bucket/3,
+	 delete/3,
 	 lookup/3,
 	 full_lookup/2,
 	 find_value/2,
-	 merge_storage/1,
+	 add_bucket/3,
+	 put_bucket/3,
+	 get_bucket/2,
+	 delete_bucket/2,
 	 merge_buckets/3,
-	 delete_key/3,
-	 delete_node_storage/2,
-	 change_metadata/3,
-	 split/3,
-	 merge/2]).
+	 split/3]).
 
 
 create() ->
   #{}.
 
-get_root_data(Root, Store) ->
-  case maps:find(Root, Store) of
-    % root node has already data Xs
-    {ok, Xs} ->
-      Xs;
-    % no data in map for root node, we must create a storage for root.
-    error ->
-      #{}
-  end.
+%%-----------------------------------------------------------------------------
+%% Element Functions.
 
+%% adds {key, value} to bucket with Id == Root.
 add(Root, Key, Value, Store) ->
   case maps:find(Root, Store) of
     % root node has already data Xs
@@ -40,50 +32,10 @@ add(Root, Key, Value, Store) ->
   Nxs = maps:put(Key, Value, Xs),
   maps:put(Root, Nxs, Store).
 
-
-add_bucket(Metadata, Bucket, Store) ->
-  NB = maps:put(Metadata, Bucket, #{}),
-  merge(NB, Store).
-
-change_metadata(OldMeta, NewMeta, Store) ->
-  case maps:find(OldMeta, Store) of
-    {ok, Xs} ->
-      Nstore = maps:remove(OldMeta, Store),
-      maps:put(NewMeta, Xs, Nstore);
-    error ->
-      Store
-  end.
-
-
-merge_buckets(OldMeta, NewMeta, Store) ->
-  OldBucket = find_value(OldMeta, Store),
-  if
-    OldBucket =:= not_found ->
-      Store;
-    true ->
-      NStore = maps:remove(OldMeta, Store),
-      add_bucket(NewMeta, OldBucket, NStore)
-  end.
-
-
-merge_storage(Store) ->
-  Ms = [X || {_,X} <- maps:to_list(Store)],
-  lists:foldl(fun(X, Y) -> maps:merge(X,Y) end, #{}, Ms).
-
-
-full_lookup(Key, Store) ->
-  Merged = merge_storage(Store),
-  find_value(Key, Merged).
-
-
-find_value(Key, L) ->
-  case maps:find(Key, L) of
-    {ok, Value} ->
-      Value;
-    error ->
-      not_found
-  end.
-
+delete(Metadata, Key, Store) ->
+  {ok, Xs} = maps:find(Metadata, Store),
+  NewXs = maps:remove(Key, Xs),
+  maps:update(Metadata, NewXs, Store).
 
 lookup(Root, Key, Store) ->
   case maps:find(Root, Store) of
@@ -101,16 +53,91 @@ lookup(Root, Key, Store) ->
   end.
 
 
-delete_node_storage(Metadata, Store) ->
+full_lookup(Key, Store) ->
+  Merged = merge_storage(Store),
+  find_value(Key, Merged).
+
+
+merge_storage(Store) ->
+  Ms = [X || {_,X} <- maps:to_list(Store)],
+  lists:foldl(fun(X, Y) -> maps:merge(X,Y) end, #{}, Ms).
+
+
+find_value(Key, L) ->
+  case maps:find(Key, L) of
+    {ok, Value} ->
+      Value;
+    error ->
+      not_found
+  end.
+
+
+
+%%-----------------------------------------------------------------------------
+%% Bucket Functions
+%%
+%% A Bucket is the hashtable which contains all the {key,value} a node is
+%% responsible for. A node's store contains several bucket (one for each
+%% node
+
+
+%% adds a bucket to the store.
+%% if there is already a bucket with the same Metadata in the store we update
+%% it with a bucket having the union of the two.
+add_bucket(Metadata, Bucket, Store) ->
+  case maps:find(Metadata, Store) of
+    {ok, Xs} ->
+      Xs;
+    error ->
+      Xs = #{}
+  end,
+  NB = maps:merge(Bucket, Xs),
+  maps:put(Metadata, NB, Store).
+
+
+%% puts bucket in store.
+%% OVERWRITES previous Buckets with the same Metadata.
+put_bucket(Metadata, Bucket, Store) ->
+  maps:put(Metadata, Bucket, Store).
+
+
+delete_bucket(Metadata, Store) ->
   maps:remove(Metadata, Store).
 
 
-delete_key(Metadata, Key, Store) ->
-  {ok, Xs} = maps:find(Metadata, Store),
-  NewXs = maps:remove(Key, Xs),
-  maps:update(Metadata, NewXs, Store).
+%% returns the bucket with Key == Metadata.
+get_bucket(Metadata, Store) ->
+  case maps:find(Metadata, Store) of
+    % root node has already data Xs
+    {ok, Xs} ->
+      Xs;
+    % no data in map for root node, we must create a storage for root.
+    error ->
+      #{}
+  end.
+
+merge_buckets(OldMeta, NewMeta, Store) ->
+  case maps:find(OldMeta, Store) of
+    {ok, Xs} ->
+      Xs;
+      error ->
+      Xs = #{}
+  end,
+  case maps:find(NewMeta, Store) of
+    {ok, Ys} ->
+      Ys;
+      error ->
+      Ys = #{}
+  end,
+  MergedBucket = maps:merge(Xs, Ys),
+  NStore = maps:remove(OldMeta, Store),
+  maps:put(NewMeta, MergedBucket, NStore).
 
 
+
+%% returns two Buckets {B1, B2}.
+%% B1 : To > Key
+%% B2 : From < Key <= To
 split(From, To, Store) ->
   case maps:find(From, Store) of
     {ok, Xs} ->
@@ -120,7 +147,3 @@ split(From, To, Store) ->
     error ->
       not_found
   end.
-
-
-merge(Store1, Store2) ->
-  maps:merge(Store1, Store2).
