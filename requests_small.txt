@@ -1,0 +1,11 @@
+insert,Hey Jude,501
+query,Hey Jude
+query,Hey Jude
+query,Hey Jude
+query,What's Going On
+insert,Hey Jude,502
+query,Like a Rolling Stone
+query,What's Going On
+query,Hey Jude
+query,Respect
+insert,Respect,503
