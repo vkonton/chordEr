@@ -31,9 +31,13 @@ Installing
 
 * Download ChordEr's sources or clone this repository.
 
-* For a default build:
+* For a default build (w/ eventual consistency):
 
 		make
+
+* For linearizability (w/ chain replication):
+
+		make chain
 
 Usage
 -----
@@ -46,7 +50,7 @@ Usage
 
 * To add nodes in an existing ring enter the command:
 
-		node:join(Key, Value, Node).
+		node:join(Int, Node).
 
 	where Int is any integer, and Node a process already in the ring.
 
@@ -57,6 +61,10 @@ Usage
 * To insert data enter the command:
 
 		node:store(Key, Value, Node).
+
+* To delete data enter the command:
+
+		node:remove(Key, Node)
 
 * To search for a key and its corresponding data use:
 
@@ -72,9 +80,9 @@ Features
 
 Some features of ChordEr are:
 
-* Support for *concurrent* node joins and departs
+* Support for *concurrent* node joins
 * Efficient implementation of finger tables
 * Logarithmic data lookup time (O(log n))
 * Logarithmic time for node joins (O(log n))
-* Data replication (default: chain replication)
+* Data replication (default: eventual consistency -- linearizability w/ chain replication also offered)
 
