@@ -20,13 +20,13 @@
 
 
 make_ring(N) ->
-  P0 = node:join(0),
+  P0 = dht:join(0),
   [wait_join(X,P0) || X <- lists:seq(1, N-1)].
 
 
 wait_join(X,P0) ->
   timer:sleep(1000),
-  node:join(X, P0).
+  dht:join(X, P0).
 
 
 test_inserts(Peers) ->
@@ -83,19 +83,19 @@ exec_request(["query", Key], Peers) ->
 random_store(Key, Val, Peers) ->
   R = random:uniform(length(Peers)),
   RandomPeer = lists:nth(R, Peers),
-  node:store(Key, Val, RandomPeer).
+  dht:store(Key, Val, RandomPeer).
 
 
 random_query(Key, Peers) ->
   R = random:uniform(length(Peers)),
   RandomPeer = lists:nth(R, Peers),
-  node:locate(Key, RandomPeer).
+  dht:locate(Key, RandomPeer).
 
 
 random_remove(Key, Peers) ->
   R = random:uniform(length(Peers)),
   RandomPeer = lists:nth(R, Peers),
-  node:remove(Key, RandomPeer).
+  dht:remove(Key, RandomPeer).
 
 
 parse_inserts(Filename) ->
@@ -120,7 +120,7 @@ parse_requests(Filename) ->
 
 
 test_storage_length(Peer) ->
-  [length(maps:to_list(X)) || {_, _, X} <- node:locate("*", Peer)].
+  [length(maps:to_list(X)) || {_, _, X} <- dht:locate("*", Peer)].
 
 
 write(Filename, Data) ->
@@ -136,12 +136,12 @@ split_it([X, Y|Xs], Keys, Values) ->
 
 
 pretty_print(Peer, N) ->
-  AllStores = node:locate("*", Peer),
+  AllStores = dht:locate("*", Peer),
   L = [{Pid, Id, bucket_pretty_print(maps:to_list(HshTbl), N)} || {Id, Pid, HshTbl} <- AllStores],
   io:format("~p ~n", [L]).
 
 output_stores(Filename, Peer) ->
-  AllStores = node:locate("*", Peer),
+  AllStores = dht:locate("*", Peer),
   L = [{Pid, Id, bucket_pretty_print(maps:to_list(HshTbl), all)} || {Id, Pid, HshTbl} <- AllStores],
   write(Filename, L).
 

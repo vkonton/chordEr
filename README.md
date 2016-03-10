@@ -44,35 +44,35 @@ Usage
 
 * To create a ring, open an Erlang shell and enter the command:
 
-		node:join(Int).
+		dht:join(Int).
 
 	where Int is any integer.
 
 * To add nodes in an existing ring enter the command:
 
-		node:join(Int, Node).
+		dht:join(Int, Node).
 
 	where Int is any integer, and Node a process already in the ring.
 
 * To remove a node from an existing ring use:
 
-		node:stop(Node).
+		dht:stop(Node).
 
 * To insert data enter the command:
 
-		node:store(Key, Value, Node).
+		dht:store(Key, Value, Node).
 
 * To delete data enter the command:
 
-		node:remove(Key, Node)
+		dht:remove(Key, Node)
 
 * To search for a key and its corresponding data use:
 
-		node:locate(Key, Node).
+		dht:locate(Key, Node).
 
 * To get the data from all nodes use:
 
-		node:locate("*", Node).
+		dht:locate("*", Node).
 
 
 Features

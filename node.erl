@@ -1,114 +1,13 @@
 -module(node).
--export([join/1,
-	 join/2,
-	 stop/1,
-	 locate/2,
-	 store/3,
-	 remove/2,
-	 between/3]).
+-export([schedule_stabilize/0, fix_fingers/0, node/5]).
+-include("macros.hrl").
 
--define(Stabilize, 1).
--define(Timeout, 10000).
--define(FTTimeout, 1000).
--define(Fix_fingers, 3).
--define(Hash_length, 160).
--define(ReplicationFactor, 5).
-
-%% Default Replication scheme is Eventual.
+%% Default Replication scheme is Eventual Consistency.
 -ifndef(EVENTUAL).
 -ifndef(CHAIN).
 -define(EVENTUAL, 1).
 -endif.
 -endif.
-
-%%--------------------------------------------------------------------
-%% Node Initiation and Connection (start/join, stop/exit).
-
-join(Inc_id) ->
-  timer:start(),
-  spawn(fun() -> init(Inc_id) end).
-
-join(Inc_id, Peer) ->
-  timer:start(),
-  spawn(fun() -> init(Inc_id, Peer) end).
-
-stop(Peer) ->
-  Peer ! stop.
-
-init(Inc_id) ->
-  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
-  Predecessor = nil,
-  Successor = {Id, self()},
-  FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
-  schedule_stabilize(),
-  fix_fingers(),
-  node(Id, Predecessor, Successor, storage:create(), FingerTable).
-
-
-init(Inc_id, Peer) ->
-  <<Id:?Hash_length/integer>> = crypto:hash(sha, <<Inc_id>>),
-  Predecessor = nil,
-  Peer ! {find_successor, Id, self()},
-  receive
-    {successor, Id, Successor} ->
-      Successor
-  end,
-  FingerTable = {0, array:new(?Hash_length+1, {default, Successor})},
-  schedule_stabilize(),
-  fix_fingers(),
-  node(Id, Predecessor, Successor, storage:create(), FingerTable).
-
-
-%%-----------------------------------------------------------------------------
-%% Client API (store, locate, remove).
-
-store(Key, Value, Peer) ->
-  Qref = make_ref(),
-  <<Hkey:?Hash_length/integer>> = crypto:hash(sha, Key),
-  Peer ! {add, Hkey, {Key,Value}, Qref, self()},
-  receive
-    {Qref, Ans} ->
-      Ans
-  after
-    ?Timeout ->
-      io:format("Time out: no response~n", [])
-  end.
-
-
-locate("*", Peer) ->
-  Qref = make_ref(),
-  Peer ! {collect_all, Qref, self()},
-  receive
-    {Qref, All_stores} ->
-      All_stores
-  after
-    ?Timeout ->
-      io:format("Time out: no response~n", [])
-  end;
-locate(Key, Peer) ->
-  Qref = make_ref(),
-  <<HKey:?Hash_length/integer>> = crypto:hash(sha, Key),
-  Peer ! {lookup, HKey, Qref, self()},
-  receive
-    {Qref, Node, Item} ->
-      {Node, Item}
-  after
-    ?Timeout ->
-      io:format("Time out: no response~n", [])
-  end.
-
-
-remove(Key, Peer) ->
-  Qref = make_ref(),
-  <<HKey:?Hash_length/integer>> = crypto:hash(sha, Key),
-  Peer ! {delete, HKey, Qref, self()},
-  receive
-    {Qref, Ans} ->
-      Ans
-  after
-    ?Timeout ->
-      io:format("Time out: no response~n", [])
-  end.
 
 
 %%--------------------------------------------------------------------
@@ -118,6 +17,7 @@ fix_fingers() ->
   timer:send_interval(?Fix_fingers, self(), fix_fingers).
 
 
+% Called periodically, fixes the FT, one finger at a time
 fix_fingers(Id, Successor, {Index, FT}) ->
   case Index+1 > ?Hash_length of
     true ->
@@ -129,6 +29,7 @@ fix_fingers(Id, Successor, {Index, FT}) ->
   {NewIndex, NewFT}.
 
 
+% Used by fix_fingers, fixes a finger table entry
 fix_finger(Id, Successor, Index, FT) ->
   Node = kth_finger(Id, Index),
   find_successor(Node, self(), Id, Successor, FT),
@@ -142,12 +43,14 @@ fix_finger(Id, Successor, Index, FT) ->
   array:set(Index, Succ, FT).
 
 
+% Function that calculates the node of whom the successor will be on the FT entry
 kth_finger(Id, K) -> (Id + (1 bsl (K-1))) rem (1 bsl ?Hash_length).
 
 
+% Finds the successor of the specified node
 find_successor(Node, Peer, Id, Successor, FT) ->
   {Skey, _} = Successor,
-  case between(Node, Id, Skey) of
+  case utilities:between(Node, Id, Skey) of
     true ->
       Peer ! {successor, Node, Successor};
     false ->
@@ -156,13 +59,14 @@ find_successor(Node, Peer, Id, Successor, FT) ->
   end.
 
 
+% Finds the closest preceding node to the target, to whom a request must be forwarded
 closest_preceding_node(Node, Id, FT) ->
   closest_preceding_node(?Hash_length, Node, Id, FT).
 closest_preceding_node(0, _, _, _) ->
   self();
 closest_preceding_node(Iter, NodeId, Id, FT) ->
   {Fkey, FPid} = array:get(Iter, FT),
-  case between2(Fkey, Id, NodeId) of
+  case utilities:between2(Fkey, Id, NodeId) of
     true ->
       FPid;
     false ->
@@ -170,6 +74,7 @@ closest_preceding_node(Iter, NodeId, Id, FT) ->
   end.
 
 
+% Refreshes finger table entries when a node has exited the ring
 refresh_fingers(Node, NodeSucc, FT) ->
   lists:foldl(
     fun(X,Acc) ->
@@ -206,7 +111,7 @@ stabilize(Pred, Id, Successor) ->
       Spid ! {notify, {Id, self()}},
       Successor;
     {Xkey, Xpid} ->
-      case between(Xkey, Id, Skey) of
+      case utilities:between(Xkey, Id, Skey) of
 	true ->
 	  Xpid ! {request_predecessor, self()},
 	  Pred;
@@ -231,7 +136,7 @@ notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
       Npid ! {delete_extra_replicas, ?ReplicationFactor-1, {Id, self()}},
       {{Nkey, Npid}, KeepStore};
     {Pkey, _} ->
-      case between(Nkey, Pkey, Id) of
+      case utilities:between(Nkey, Pkey, Id) of
 	true ->
 	  {KeepStore, ToSend} = update_store(Nkey, Id, Store),
 	  if
@@ -248,7 +153,7 @@ notify({Nkey, Npid}, Id, Predecessor, {_Skey, Spid}, Store) ->
   end.
 
 
-%% split my store and return two buckets upon node insert.
+%% Split my store and return two buckets upon node insert.
 update_store(Nkey, Id, Store) ->
   case storage:split(Id, Nkey, Store) of
     {Keep, Rest} ->
@@ -337,7 +242,7 @@ lookup_chain(Key, RootId, RepFactor, Qref, Client, {_, Spid}, Store) ->
 
 
 find_root(Key, Qref, Client, Id, {Pkey, _}, FT) ->
-  case between(Key, Pkey, Id) of
+  case utilities:between(Key, Pkey, Id) of
     true ->
       Client ! {Qref, Id, self()};
     false ->
@@ -355,7 +260,7 @@ find_root(Key, Qref, Client, Id, {Pkey, _}, FT) ->
 -ifdef(CHAIN).
 
 add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
-  case between(Key, Pkey, Id) of
+  case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
       Spid ! {replicate_chain, Key, Id, ?ReplicationFactor-1, Value, Qref, Client},
@@ -373,7 +278,7 @@ add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
 
 
 delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
-  case between(Key, Pkey, Id) of
+  case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
       Nstore = storage:delete(Id, Key, Store),
@@ -392,7 +297,7 @@ delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
 
 
 lookup(Key, Qref, Client, Id, {Pkey, _}, Successor, FT, _) ->
-  case between(Key, Pkey, Id) of
+  case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
       {_, Spid} = Successor,
@@ -417,7 +322,7 @@ lookup(Key, Qref, Client, Id, {Pkey, _}, Successor, FT, _) ->
 %% The message to client that the write is complete is sent by the
 %% root(master) node.
 add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
-  case between(Key, Pkey, Id) of
+  case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
       Client ! {Qref, self()},
@@ -436,7 +341,7 @@ add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
 
 
 delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
-  case between(Key, Pkey, Id) of
+  case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
       Nstore = storage:delete(Id, Key, Store),
@@ -815,21 +720,3 @@ remove_probe(T, Nodes) ->
 
 forward_probe(Ref, T, Nodes, {_,Spid}) ->
   Spid ! {probe,Ref,Nodes ++ [self()],T}.
-
-
-%%-----------------------------------------------------------------------------
-%% Help Functions to ensure node and key sorting.
-between(_, From, From) ->
-  true;
-between(Key, From, To) when From < To ->
-  (Key > From) and (Key =< To);
-between(Key, From, To) when From > To ->
-  (Key > From) or (Key =< To).
-
-
-between2(_, From, From) ->
-  true;
-between2(Key, From, To) when From < To ->
-  (Key > From) and (Key < To);
-between2(Key, From, To) when From > To ->
-  (Key > From) or (Key < To).
