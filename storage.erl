@@ -42,7 +42,7 @@ lookup(Root, Key, Store) ->
     % root node has data Xs, search for Key in Xs.
     {ok, Xs} ->
       case maps:find(Key, Xs) of
-	{Key, Value} ->
+	{ok, Value} ->
 	  Value;
 	false ->
 	  not_found

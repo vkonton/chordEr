@@ -81,6 +81,9 @@ locate("*", Peer) ->
   receive
     {Qref, All_stores} ->
       All_stores
+  after
+    ?Timeout ->
+      io:format("Time out: no response~n", [])
   end;
 locate(Key, Peer) ->
   Qref = make_ref(),
@@ -155,7 +158,6 @@ find_successor(Node, Peer, Id, Successor, FT) ->
 
 closest_preceding_node(Node, Id, FT) ->
   closest_preceding_node(?Hash_length, Node, Id, FT).
-
 closest_preceding_node(0, _, _, _) ->
   self();
 closest_preceding_node(Iter, NodeId, Id, FT) ->
@@ -318,7 +320,23 @@ delete_replica_eventual(Key, RootId, RepFactor, {_, Spid}, Store) ->
   Nstore.
 
 
-primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
+lookup_chain(Key, RootId, RepFactor, Qref, Client, {_, Spid}, Store) ->
+  if
+    RepFactor > 1 ->
+      Spid ! {lookup_chain, Key, RootId, RepFactor-1, Qref, Client};
+    RepFactor =:= 1 ->
+      case storage:lookup(RootId, Key, Store) of
+        not_found ->
+	  Client ! {Qref, self(), not_exists};
+	X ->
+	  Client ! {Qref, self(), X}
+      end;
+    RepFactor < 1 ->
+      ok
+  end.
+
+
+find_root(Key, Qref, Client, Id, {Pkey, _}, FT) ->
   case between(Key, Pkey, Id) of
     true ->
       Client ! {Qref, Id, self()};
@@ -328,8 +346,9 @@ primary_lookup(Key, Qref, Client, Id, {Pkey, _}, FT) ->
 	{successor, Key, {_, Npid}} ->
 	  Npid
       end,
-      Npid ! {primary_lookup, Key, Qref, Client}
+      Npid ! {find_root, Key, Qref, Client}
   end.
+
 
 %%----------------------------------------------------------------------------
 %% Core functions Implementing Chain Replication.
@@ -372,23 +391,20 @@ delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   Nstore.
 
 
-lookup(Key, Qref, Client, Id, Store, FT) ->
-  Result = storage:full_lookup(Key, Store),
-  case Result of
-    not_found ->
-      find_successor(Key, self(), Id, array:get(1, FT), FT),
+lookup(Key, Qref, Client, Id, {Pkey, _}, Successor, FT, _) ->
+  case between(Key, Pkey, Id) of
+    % my Id is RootId for this Key.
+    true ->
+      {_, Spid} = Successor,
+      % delegate read to the last replication node.
+      Spid ! {lookup_chain, Key, Id, ?ReplicationFactor-1, Qref, Client};
+    false ->
+      find_successor(Key, self(), Id, Successor, FT),
       receive
 	{successor, Key, {_, Npid}} ->
 	  Npid
       end,
-      if
-	Npid =:= self() ->
-	  Client ! {Qref, self(), not_exists};
-	true ->
-	  Npid ! {lookup, Key, Qref, Client}
-      end;
-    Value ->
-      Client ! {Qref, self(), Value}
+      Npid ! {lookup, Key, Qref, Client}
   end.
 
 -endif.
@@ -438,7 +454,7 @@ delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   Nstore.
 
 
-lookup(Key, Qref, Client, Id, Store, FT) ->
+lookup(Key, Qref, Client, Id, _, _, FT, Store) ->
   Result = storage:full_lookup(Key, Store),
   case Result of
     not_found ->
@@ -456,8 +472,6 @@ lookup(Key, Qref, Client, Id, Store, FT) ->
     Value ->
       Client ! {Qref, self(), Value}
   end.
-
-
 
 -endif.
 
@@ -520,12 +534,16 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
 
     %% query for an element in the dht
     {lookup, Key, Qref, Client} ->
-      lookup(Key, Qref, Client, Id, Store, FT),
+      lookup(Key, Qref, Client, Id, Predecessor, Successor, FT, Store),
+      node(Id, Predecessor, Successor, Store, FingerTable);
+
+    {lookup_chain, Key, RootId, RepFactor, Qref, Client} ->
+      lookup_chain(Key, RootId, RepFactor, Qref, Client, Successor, Store),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     %% finds the primary storage of a key
-    {primary_lookup, Key, Qref, Client} ->
-      primary_lookup(Key, Qref, Client, Id, Predecessor, FT),
+    {find_root, Key, Qref, Client} ->
+      find_root(Key, Qref, Client, Id, Predecessor, FT),
       node(Id, Predecessor, Successor, Store, FingerTable);
 
     %%-------------------------------------------------------------------------
@@ -626,20 +644,13 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
     %%-------------------------------------------------------------------------
     %% Node Depart Replication.
     {fix_replicas, OldRootId, Bucket} ->
-      %%io:format("Eimai o newRoot, ~p ~n", [self()]),
-      %%io:format("Exw ID, ~p ~n", [Id]),
-      %%test:write("pairnw_apo_ton_12", Bucket),
       DelStore = storage:delete_bucket(OldRootId, Store),
       NStore = storage:add_bucket(Id, Bucket, DelStore),
-
-      test:write("TOYOLO2", NStore),
-
       {_, Spid} = Successor,
       Spid ! {merge_replicas, ?ReplicationFactor-1, OldRootId, {Id, self()}},
       node(Id, Predecessor, Successor, NStore, FingerTable);
 
     {merge_replicas, RepFactor, OldRootId, NewRoot} ->
-      %% io:format("Eftasa sto merge manmu, ~p ~n", [self()]),
       {_, Spid} = Successor,
       {NewRootId, NewRootPid} = NewRoot,
       if
@@ -655,7 +666,6 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       node(Id, Predecessor, Successor, NStore, FingerTable);
 
     {give_me_replicas, Npid} ->
-      io:format("End to End pro data transfer operation, from ~p to ~p ~n", [self(), Npid]),
       RootBucket = storage:get_bucket(Id, Store),
       Npid ! {handover, Id, RootBucket},
       node(Id, Predecessor, Successor, Store, FingerTable);
@@ -726,7 +736,6 @@ node(Id, Predecessor, Successor, Store, FingerTable = {NextFingerToUpdate, FT}) 
       receive
 	exit_ok ->
 	  ToSend = storage:get_bucket(Id,Store),
-	  test:write("dinei_o_12", ToSend),
 	  Spid ! {fix_replicas, Id, ToSend},
 	  Ppid ! {replicate_on_last_node, ?ReplicationFactor-1},
 	  exit(normal)
