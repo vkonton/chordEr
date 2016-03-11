@@ -1,5 +1,6 @@
 -module(test).
--export([make_ring/1,
+-export([start_nodes/3,
+	 make_ring/1,
 	 parse_inserts/1,
 	 parse_queries/1,
 	 parse_requests/1,
@@ -17,6 +18,10 @@
 	 output_stores/2,
 	 take/2,
 	 clr/0]).
+
+
+start_nodes(From, To, Peer) ->
+  [wait_join(X, Peer) || X <-lists:seq(From, To)].
 
 
 make_ring(N) ->
