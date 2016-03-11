@@ -142,7 +142,7 @@ split(From, To, Store) ->
   case maps:find(From, Store) of
     {ok, Xs} ->
       Ys = maps:to_list(Xs),
-      {KeepL, RestL} = lists:partition(fun({Key, _}) -> not (node:between(Key, From, To)) end, Ys),
+      {KeepL, RestL} = lists:partition(fun({Key, _}) -> not (utilities:between(Key, From, To)) end, Ys),
       {maps:from_list(KeepL), maps:from_list(RestL)};
     error ->
       not_found
