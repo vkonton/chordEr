@@ -49,7 +49,7 @@ store(Key, Value, Peer) ->
   Peer ! {add, Hkey, {Key,Value}, Qref, self()},
   receive
     {Qref, Ans} ->
-      Ans
+      {inserted, {Key, Value}, Ans}
   after
     ?Timeout ->
       io:format("Time out: no response~n", [])

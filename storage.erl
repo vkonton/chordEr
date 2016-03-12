@@ -44,7 +44,7 @@ lookup(Root, Key, Store) ->
       case maps:find(Key, Xs) of
 	{ok, Value} ->
 	  Value;
-	false ->
+	error ->
 	  not_found
       end;
     % root node does not exist in the map.

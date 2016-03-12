@@ -263,8 +263,13 @@ add(Key, Value, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
-      Spid ! {replicate_chain, Key, Id, ?ReplicationFactor-1, Value, Qref, Client},
-      Nstore = storage:add(Id, Key, Value, Store);
+      Nstore = storage:add(Id, Key, Value, Store),
+      if
+	?ReplicationFactor > 1 ->
+	  Spid ! {replicate_chain, Key, Id, ?ReplicationFactor-1, Value, Qref, Client};
+        true ->
+          Client ! {Qref, self()}
+      end;
     false ->
       find_successor(Key, self(), Id, Successor, FT),
       receive
@@ -282,8 +287,12 @@ delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
     % my Id is RootId for this Key.
     true ->
       Nstore = storage:delete(Id, Key, Store),
-      Client ! {Qref, self()},
-      Spid ! {delete_replica_chain, Key, Id, ?ReplicationFactor-1, Qref, Client};
+      if
+	?ReplicationFactor > 1 ->
+          Spid ! {delete_replica_chain, Key, Id, ?ReplicationFactor-1, Qref, Client};
+        true ->
+	  Client ! {Qref, self()}
+      end;
     false ->
       find_successor(Key, self(), Id, Successor, FT),
       receive
@@ -296,13 +305,23 @@ delete(Key, Qref, Client, Id, {Pkey, _}, Successor={_, Spid}, FT, Store) ->
   Nstore.
 
 
-lookup(Key, Qref, Client, Id, {Pkey, _}, Successor, FT, _) ->
+lookup(Key, Qref, Client, Id, {Pkey, _}, Successor, FT, Store) ->
   case utilities:between(Key, Pkey, Id) of
     % my Id is RootId for this Key.
     true ->
       {_, Spid} = Successor,
       % delegate read to the last replication node.
-      Spid ! {lookup_chain, Key, Id, ?ReplicationFactor-1, Qref, Client};
+      if
+	?ReplicationFactor > 1 ->
+          Spid ! {lookup_chain, Key, Id, ?ReplicationFactor-1, Qref, Client};
+        true ->
+      case storage:lookup(Id, Key, Store) of
+        not_found ->
+	  Client ! {Qref, self(), not_exists};
+	X ->
+	  Client ! {Qref, self(), X}
+      end
+      end;
     false ->
       find_successor(Key, self(), Id, Successor, FT),
       receive
