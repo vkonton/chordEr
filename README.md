@@ -39,6 +39,10 @@ Installing
 
 		make chain
 
+* To build test functions:
+
+     	   	make test
+
 Usage
 -----
 

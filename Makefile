@@ -1,12 +1,14 @@
 .SUFFIXES: .beam .erl
 .PHONY: utilities default clean chain eventual
 
-MAIN_FILE=node.erl
-MACROS_FILE=macros.hrl
+MAIN_FILE=src/node.erl
+MACROS_FILE=src/macros.hrl
 
 default: eventual
 
-utilities: dht.beam storage.beam test.beam sira.beam utilities.beam
+test: $(addprefix helper/, sira.beam test.beam)
+
+utilities: $(addprefix src/, dht.beam storage.beam utilities.beam)
 
 chain: utilities
 	erlc +debug_info -DCHAIN ${MAIN_FILE}
